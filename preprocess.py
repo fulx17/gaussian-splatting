@@ -43,25 +43,25 @@ def preprocess_scene(scene_path):
 
     print(f"Còn lại sau khi xóa: {len(images)}")
 
-    removed_points = 0
-    for pt_id in list(points3D.keys()):
-        pt = points3D[pt_id]
+    # removed_points = 0
+    # for pt_id in list(points3D.keys()):
+    #     pt = points3D[pt_id]
 
-        keep_mask = [img_id not in missing_ids for img_id in pt.image_ids]
+    #     keep_mask = [img_id not in missing_ids for img_id in pt.image_ids]
 
-        if not any(keep_mask):
-            del points3D[pt_id]
-            removed_points += 1
-        elif not all(keep_mask):
-            new_image_ids = pt.image_ids[keep_mask]
-            new_point2D_idxs = pt.point2D_idxs[keep_mask]
-            points3D[pt_id] = pt._replace(
-                image_ids=new_image_ids,
-                point2D_idxs=new_point2D_idxs,
-            )
+    #     if not any(keep_mask):
+    #         del points3D[pt_id]
+    #         removed_points += 1
+    #     elif not all(keep_mask):
+    #         new_image_ids = pt.image_ids[keep_mask]
+    #         new_point2D_idxs = pt.point2D_idxs[keep_mask]
+    #         points3D[pt_id] = pt._replace(
+    #             image_ids=new_image_ids,
+    #             point2D_idxs=new_point2D_idxs,
+    #         )
 
-    print(f"Đã xóa {removed_points} points3D không còn observation nào")
-    print(f"Points3D còn lại: {len(points3D)}")
+    # print(f"Đã xóa {removed_points} points3D không còn observation nào")
+    # print(f"Points3D còn lại: {len(points3D)}")
 
     # ghi đè luôn
     write_cameras_binary(cameras, str(sparse_path / "cameras.bin"))
