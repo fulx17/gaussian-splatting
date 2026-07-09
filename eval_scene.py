@@ -46,7 +46,7 @@ def eval_scene(gt_path, sample_path):
 
         ssims.append(ssim(sample_img, gt_img).item())
         psnrs.append(psnr(sample_img, gt_img).item())
-        lpipss.append(lpips(sample_img, gt_img, net_type='vgg').item())
+        lpipss.append(lpips(sample_img, gt_img, net_type='alex').item())
 
     return {
         "num_images": len(common),
