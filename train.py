@@ -199,6 +199,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     if cap_max <= 0 or gaussians.get_xyz.shape[0] < cap_max:
                         size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                         gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
+                        torch.cuda.empty_cache()
                     else:
                         prune_mask = (gaussians.get_opacity < 0.005).squeeze()
                         gaussians.prune_points(prune_mask)
