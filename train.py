@@ -173,7 +173,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 score = 0.4 * (1 - lpips_val) + 0.3 * ssim_val + 0.3 * psnr_norm
                 analyse_file.write(f"{iteration},{l1_val:.6f},{ssim_val:.6f},{lpips_val:.6f},{psnr_val:.6f},{score:.6f}\n")
                 analyse_file.flush()
-                print(f"[ITER {iteration}] L1={l1_val:.4f} SSIM={ssim_val:.4f} LPIPS={lpips_val:.4f} PSNR={psnr_val:.2f} score={score:.4f}")
+                print(f"[ITER {iteration}] L1={l1_val:.4f} SSIM={ssim_val:.4f} LPIPS={lpips_val:.4f} PSNR={psnr_val:.2f} score={score:.4f}", flush=True)
 
             if iteration % 10 == 0:
                 # VAR: log gaussians numbers 
