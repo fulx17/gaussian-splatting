@@ -9,7 +9,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_dir", default="/kaggle/working/model_outputs")
     parser.add_argument("--input_dir", default="/kaggle/working/cleaned_inputs")
     parser.add_argument("--image_dir", default="/kaggle/working/image_outputs")
-    parser.add_argument("--iteration", default=-1, type=int)
+    parser.add_argument("--iterations", default=-1, type=int)
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--skip_existing", action="store_true")
     parser.add_argument("--subset", nargs="+", default=[])
