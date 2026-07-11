@@ -278,6 +278,7 @@ def render_scene(dataset, pipeline, input_dir ,output_dir, scene_name, iteration
             # (dist["width"], dist["height"]) bang offset giua 2 tam quang hoc --
             # giong het pattern trong experiment_distort.py.
             if abs(dist["k"]) > 1e-8:
+                rendering_before = rendering.clone()
                 rendering = redistort_and_crop(
                     rendering,
                     f=und["f"],
@@ -289,6 +290,16 @@ def render_scene(dataset, pipeline, input_dir ,output_dir, scene_name, iteration
                     orig_w=dist["width"],
                     orig_h=dist["height"],
                 )
+                # THEMMM
+                if idx == 0:
+                    # crop rendering_before ve cung kich thuoc de so sanh cho cong bang
+                    _, Hc, Wc = rendering.shape
+                    crop_before = rendering_before[:, :Hc, :Wc]  # crop tho, chi de debug
+                    diff = (rendering - crop_before).abs()
+                    print(f"[DEBUG] redistort diff: mean={diff.mean().item():.6f} "
+                        f"max={diff.max().item():.6f}")
+                    torchvision.utils.save_image(rendering_before, "/kaggle/working/debug_before_redistort.png")
+                    torchvision.utils.save_image(rendering, "/kaggle/working/debug_after_redistort.png")
 
             out_path = scene_dir / row["image_name"]
             torchvision.utils.save_image(rendering, out_path)
