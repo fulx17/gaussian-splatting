@@ -273,6 +273,27 @@ def render_scene(dataset, pipeline, input_dir ,output_dir, scene_name, iteration
                 separate_sh=SPARSE_ADAM_AVAILABLE,
             )["render"]
 
+            if idx == 0:
+                # VAR-DEBUG: ve luoi len anh render TRUOC khi redistort, de kiem tra
+                # warp phi tuyen co thuc su xay ra hay chi la tinh tien (crop offset).
+                debug_grid = rendering.clone()
+                C, Hc, Wc = debug_grid.shape
+                step = 50
+                for gx in range(0, Wc, step):
+                    debug_grid[:, :, gx] = torch.tensor([1.0, 0.0, 0.0], device=debug_grid.device).view(3, 1)
+                for gy in range(0, Hc, step):
+                    debug_grid[:, gy, :] = torch.tensor([1.0, 0.0, 0.0], device=debug_grid.device).view(3, 1)
+
+                debug_grid_after = redistort_and_crop(
+                    debug_grid,
+                    f=und["f"], cx_render=und["cx"], cy_render=und["cy"],
+                    k=dist["k"],
+                    cx_orig=dist["cx"], cy_orig=dist["cy"],
+                    orig_w=dist["width"], orig_h=dist["height"],
+                )
+                torchvision.utils.save_image(debug_grid, "/kaggle/working/debug_grid_before.png")
+                torchvision.utils.save_image(debug_grid_after, "/kaggle/working/debug_grid_after.png")
+
             # VAR: redistort tren canvas mo rong (dung intrinsics cua chinh canvas do:
             # und["f"], und["cx"], und["cy"]) roi crop ve dung kich thuoc GT goc
             # (dist["width"], dist["height"]) bang offset giua 2 tam quang hoc --
