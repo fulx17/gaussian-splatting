@@ -1,8 +1,8 @@
 import argparse
 import os
 import shutil
+import subprocess
 import tempfile
-import pycolmap
 from pathlib import Path
 
 from utils.read_write_model import (
@@ -49,7 +49,19 @@ def preprocess_scene(scene_path):
 
     print(f"Đã cập nhật reconstruction.")
 
-def undistort_scene(scene_path):
+def undistort_scene(scene_path, blank_pixels=1.0, min_scale=1.0, max_scale=2.0):
+    """
+    Undistort dung COLMAP CLI (C++) - nhanh hon nhieu so voi pycolmap python API,
+    vi chay truc tiep binary C++, khong qua overhead Python/GIL.
+
+    blank_pixels=1.0: chap nhan toi da pixel den, uu tien KHONG CROP mat noi dung goc
+                       (tuong duong --blank_pixels 1 trong docs COLMAP).
+    min_scale/max_scale: khoang scale COLMAP duoc phep tu dieu chinh de thoa blank_pixels.
+
+    LUU Y: COLMAP tu dong chon scale NHO NHAT du de thoa dieu kien blank_pixels,
+    khong co nghia la no se dung het max_scale. Neu can canvas lon hon, phai
+    tu can thiep them (vd dung script CV2 thu cong da test o cho khac).
+    """
     scene_path = Path(scene_path)
 
     image_dir = scene_path / "train" / "images"
@@ -57,13 +69,23 @@ def undistort_scene(scene_path):
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="undistort_"))
 
-    print(f"Undistorting {scene_path.name}...")
+    print(f"Undistorting {scene_path.name} (COLMAP CLI)...")
 
     try:
-        pycolmap.undistort_images(
-            output_path=str(tmp_dir),
-            input_path=str(sparse_dir),
-            image_path=str(image_dir),
+        result = subprocess.run(
+            [
+                "colmap", "image_undistorter",
+                "--image_path", str(image_dir),
+                "--input_path", str(sparse_dir),
+                "--output_path", str(tmp_dir),
+                "--output_type", "COLMAP",
+                "--blank_pixels", str(blank_pixels),
+                "--min_scale", str(min_scale),
+                "--max_scale", str(max_scale),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
         )
 
         # Thay ảnh
@@ -74,6 +96,10 @@ def undistort_scene(scene_path):
         shutil.rmtree(sparse_dir)
         shutil.copytree(tmp_dir / "sparse", sparse_dir)
 
+    except subprocess.CalledProcessError as e:
+        print(f"LOI khi undistort {scene_path.name}:")
+        print(e.stderr)
+        raise
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
