@@ -214,6 +214,42 @@ def render_scene(dataset, pipeline, input_dir ,output_dir, scene_name, iteration
     und = load_undistorted_camera_params(input_dir, scene_name)
     print(f"[{scene_name}] undistorted render canvas f={und['f']:.2f} "
           f"cx={und['cx']:.2f} cy={und['cy']:.2f} size=({und['width']}x{und['height']})")
+    
+
+    #====================================================================================================================
+    print(f"[{scene_name}] dist: k={dist['k']:.8f} f={dist['f']:.3f} "
+        f"size=({dist['width']}x{dist['height']})")
+    print(f"[{scene_name}] und : f={und['f']:.3f} "
+        f"size=({und['width']}x{und['height']})")
+
+    # So sanh f_undist vs f_orig -- thuat toan redistort_and_crop dang GIA DINH 2 gia tri
+    # nay xap xi bang nhau (chi lech cx,cy do canvas mo rong). Neu lech nhieu, do cong
+    # tinh ra se bi sai ty le.
+    f_diff_pct = abs(und['f'] - dist['f']) / dist['f'] * 100
+    print(f"f_undist vs f_orig: diff={und['f']-dist['f']:+.3f}  ({f_diff_pct:.2f}%)")
+
+    # Ban kinh chuan hoa tai GOC anh (worst case that su, khong phai mep giua canh)
+    # vi diem xa tam quang hoc nhat luon nam o 4 goc, khong phai mep ngang/doc.
+    rd_edge_mid = (dist['width'] / 2) / dist['f']          # mep giua canh ngang (cu, thieu)
+    rd_corner = np.sqrt((dist['width'] / 2) ** 2 + (dist['height'] / 2) ** 2) / dist['f']  # goc anh
+
+    for label, rd in [("mep giua canh", rd_edge_mid), ("goc anh (worst case)", rd_corner)]:
+        delta = dist['k'] * rd ** 3
+        pct = abs(delta) / rd * 100
+        print(f"  rd={rd:.4f} tai [{label}]: k*rd^3={delta:.6f}  (lech {pct:.2f}% so voi rd)")
+
+    # Kiem tra vung invalid (chi xay ra khi k < 0): neu rd_corner > rd_max, nghia la
+    # 4 goc anh GOC nam trong vung KHONG CO NGHIEM THAT khi redistort -- day la vung
+    # se bi mat/den neu code xu ly dung (giong het ảnh 2 cua experiment_distort.py).
+    if dist['k'] < 0:
+        ru_max = np.sqrt(-1.0 / (3 * dist['k']))
+        rd_max = ru_max + dist['k'] * ru_max ** 3
+        print(f"k<0 -> rd_max (nguong co nghiem)={rd_max:.4f}")
+        print(f"  rd_corner ({rd_corner:.4f}) {'VUOT NGUONG -> co vung invalid o goc anh' if rd_corner > rd_max else 'trong nguong, khong co vung invalid'}")
+    else:
+        print("k >= 0 -> khong co vung invalid (chi xay ra khi k<0)")
+
+    #=============================================================================================================
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
