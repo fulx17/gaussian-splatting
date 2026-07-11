@@ -85,7 +85,7 @@ def preprocess_dataset(path, output_dir):
 
     for scene in os.listdir(path):
         output_scene_path = output_dir / scene 
-        # undistort_scene(output_scene_path)     
+        undistort_scene(output_scene_path)     
         preprocess_scene(output_scene_path)  
 
 def validate(path):
