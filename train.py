@@ -77,11 +77,15 @@ def render_test_samples(dataset, gaussians, pipe, background, iteration,
     ra analyse_file.
     """
     source_path = Path(dataset.source_path)
-    scene_name = source_path.name
-    input_dir = source_path.parent
-    test_poses_csv = source_path / "test" / "test_poses.csv"
-    gt_dir = source_path / "test" / "images"
+    scene_name = source_path.parent.name
+    input_dir = source_path.parent.parent
+
+    scene_dir = input_dir / scene_name  
+    test_poses_csv = scene_dir / "test" / "test_poses.csv"
+    gt_dir = scene_dir / "test" / "images"
+
     if not test_poses_csv.exists():
+        print(f"[TEST RENDER] Khong tim thay {test_poses_csv}, bo qua test render.", flush=True)
         return
 
     dist = load_distortion_params(orig_dir, scene_name)
