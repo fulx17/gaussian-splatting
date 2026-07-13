@@ -179,8 +179,74 @@ def render_test_samples(dataset, gaussians, pipe, background, iteration,
         print(f"[TEST ITER {iteration}] Khong tim thay GT nao khop "
               f"(kiem tra gt_dir: {gt_dir})", flush=True)
 
+def infer_one_test_image(dataset, gaussians, pipe, background, iteration, orig_dir):
+    """
+    EXP: render 1 anh CO DINH (dong dau tien trong test_poses.csv) de theo doi
+    truc quan qua trinh train. Duong dan/ten anh HARD-CODE trong ham, khong
+    can them CLI arg vi day chi la thu nghiem.
+    """
+    source_path = Path(dataset.source_path)
+    scene_name = source_path.parent.name
+    input_dir = source_path.parent.parent
+    scene_dir = input_dir / scene_name
+    test_poses_csv = scene_dir / "test" / "test_poses.csv"
+    if not test_poses_csv.exists() or orig_dir is None:
+        return
+
+    dist = load_distortion_params(orig_dir, scene_name)
+    und = load_undistorted_camera_params(input_dir, scene_name)
+
+    with open(test_poses_csv, newline="") as f:
+        rows = list(csv.DictReader(f))
+    if not rows:
+        return
+    row = rows[0]  # EXP: luon chon anh dau tien, co dinh xuyen suot qua trinh train
+
+    out_dir = Path(dataset.model_path) / "exp_infer"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"iter_{iteration:06d}.png"
+
+    with torch.no_grad():
+        camera = camera_from_csv_row(
+            row, 0, dataset.data_device,
+            width=und["width"], height=und["height"],
+            fx=und["f"], fy=und["f"],
+        )
+        rendering = render(
+            camera, gaussians, pipe, background,
+            use_trained_exp=dataset.train_test_exp,
+            separate_sh=SPARSE_ADAM_AVAILABLE,
+        )["render"]
+
+        if abs(dist["k"]) > 1e-8:
+            rendering = redistort_and_crop(
+                rendering,
+                f=und["f"], cx_render=und["cx"], cy_render=und["cy"],
+                k=dist["k"], cx_orig=dist["cx"], cy_orig=dist["cy"],
+                orig_w=dist["width"], orig_h=dist["height"],
+            )
+        torchvision.utils.save_image(rendering, out_path)
+        del camera, rendering
+
+    print(f"[EXP INFER] Saved {out_path}", flush=True)
+
+def compute_component_gradnorm(loss_term, params):
+    """
+    Tinh L2-gradnorm cua 1 loss component rieng le, KHONG lam ban optimizer
+    (dung autograd.grad thay vi backward()). retain_graph=True de giu graph
+    cho cac lan goi tiep theo va backward() tong cuoi cung.
+    """
+    if not torch.is_tensor(loss_term) or not loss_term.requires_grad:
+        return 0.0
+    grads = torch.autograd.grad(loss_term, params, retain_graph=True, allow_unused=True)
+    total_sq = 0.0
+    for g in grads:
+        if g is not None:
+            total_sq += g.detach().float().pow(2).sum().item()
+    return total_sq ** 0.5
+
 # VAR: add cap max
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, cap_max=-1, analyse_path=None, orig_dir = None, test_render_every=50, test_render_samples=15):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, cap_max=-1, analyse_path=None, orig_dir = None, test_render_every=50, test_render_samples=15, lambda_lpips=0.15):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
@@ -189,13 +255,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     tb_writer = prepare_output_and_logger(dataset)
 
     #VAR: add logger
+    # analyse_file = None
+    # if analyse_path is not None:
+    #     out_dir = os.path.dirname(analyse_path)
+    #     if out_dir:
+    #         os.makedirs(out_dir, exist_ok=True)
+    #     analyse_file = open(analyse_path, "w")
+    #     analyse_file.write("iteration,L1,SSIM,LPIPS,PSNR,score\n")
+
+    #VAR: analyse_file gio dung de log per-step (L1, SSIM, depth, LPIPS + gradnorm)
     analyse_file = None
     if analyse_path is not None:
         out_dir = os.path.dirname(analyse_path)
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
         analyse_file = open(analyse_path, "w")
-        analyse_file.write("iteration,L1,SSIM,LPIPS,PSNR,score\n")
+        analyse_file.write(
+            "iteration,L1,SSIM_loss,Depth,LPIPS,"
+            "L1_gradnorm,SSIM_gradnorm,Depth_gradnorm,LPIPS_gradnorm\n"
+        )
 
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
@@ -273,7 +351,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             ssim_value = ssim(image, gt_image)
 
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+        #VAR: new loss
+        lpips_value = lpips(image.unsqueeze(0), gt_image.unsqueeze(0), net_type='squeeze')
+
+        loss = ((1.0 - opt.lambda_dssim - lambda_lpips) * Ll1
+                + opt.lambda_dssim * (1.0 - ssim_value)
+                + lambda_lpips * lpips_value)
 
         # Depth regularization
         Ll1depth_pure = 0.0
@@ -288,23 +371,50 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             Ll1depth = Ll1depth.item()
         else:
             Ll1depth = 0
+        
+
+        # VAR: tinh gradnorm rieng cho tung loss component (TRUOC khi loss.backward() tong)
+        grad_params = [p for group in gaussians.optimizer.param_groups for p in group['params']]
+
+        l1_gradnorm = compute_component_gradnorm(Ll1, grad_params)
+        ssim_gradnorm = compute_component_gradnorm(1.0 - ssim_value, grad_params)
+        depth_gradnorm = compute_component_gradnorm(
+            Ll1depth_pure if torch.is_tensor(Ll1depth_pure) else torch.tensor(0.0), grad_params
+        )
+        lpips_gradnorm = compute_component_gradnorm(lpips_value, grad_params)
 
         loss.backward()
 
         iter_end.record()
 
         with torch.no_grad():
+
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
 
             # VAR: render mau test that (co GT) va ghi metric
-            if orig_dir is not None and analyse_file is not None and iteration % test_render_every == 0:
-                render_test_samples(
-                    dataset, gaussians, pipe, background, iteration,
-                    orig_dir, num_samples=test_render_samples,
-                    analyse_file=analyse_file,
+            # if orig_dir is not None and analyse_file is not None and iteration % test_render_every == 0:
+            #     render_test_samples(
+            #         dataset, gaussians, pipe, background, iteration,
+            #         orig_dir, num_samples=test_render_samples,
+            #         analyse_file=analyse_file,
+            #     )
+            # VAR: log moi step vao analyse_file (L1, SSIM, depth, LPIPS + gradnorm)
+            if analyse_file is not None:
+                depth_val = Ll1depth_pure.item() if torch.is_tensor(Ll1depth_pure) else float(Ll1depth_pure)
+                analyse_file.write(
+                    f"{iteration},{Ll1.item():.6f},{(1.0 - ssim_value).item():.6f},"
+                    f"{depth_val:.6f},{lpips_value.item():.6f},"
+                    f"{l1_gradnorm:.6f},{ssim_gradnorm:.6f},"
+                    f"{depth_gradnorm:.6f},{lpips_gradnorm:.6f}\n"
                 )
+                if iteration % 50 == 0:
+                    analyse_file.flush()
+
+            # VAR: render 1 anh test co dinh moi 50 step (exp, khong can GT)
+            if orig_dir is not None and iteration % 50 == 0:
+                infer_one_test_image(dataset, gaussians, pipe, background, iteration, orig_dir)
 
             if iteration % 10 == 0:
                 # VAR: log gaussians numbers 
