@@ -179,11 +179,12 @@ def render_test_samples(dataset, gaussians, pipe, background, iteration,
         print(f"[TEST ITER {iteration}] Khong tim thay GT nao khop "
               f"(kiem tra gt_dir: {gt_dir})", flush=True)
 
-def infer_one_test_image(dataset, gaussians, pipe, background, iteration, orig_dir):
+def infer_one_test_image(dataset, gaussians, pipe, background, iteration, orig_dir,
+                          fixed_image_name="DJI_20241229123233_0050_V.JPG"):
     """
-    EXP: render 1 anh CO DINH (dong dau tien trong test_poses.csv) de theo doi
-    truc quan qua trinh train. Duong dan/ten anh HARD-CODE trong ham, khong
-    can them CLI arg vi day chi la thu nghiem.
+    EXP: render 1 anh CO DINH (theo ten fixed_image_name) de theo doi truc quan
+    qua trinh train. Ten anh HARD-CODE trong ham, khong can them CLI arg vi
+    day chi la thu nghiem.
     """
     source_path = Path(dataset.source_path)
     scene_name = source_path.parent.name
@@ -200,7 +201,13 @@ def infer_one_test_image(dataset, gaussians, pipe, background, iteration, orig_d
         rows = list(csv.DictReader(f))
     if not rows:
         return
-    row = rows[0]  # EXP: luon chon anh dau tien, co dinh xuyen suot qua trinh train
+
+    # EXP: tim dung row theo ten anh co dinh, fallback ve rows[0] neu khong thay
+    row = next((r for r in rows if r["image_name"] == fixed_image_name), None)
+    if row is None:
+        print(f"[EXP INFER] Khong tim thay image_name={fixed_image_name} trong "
+              f"test_poses.csv, dung rows[0] thay the.", flush=True)
+        row = rows[0]
 
     out_dir = Path(dataset.model_path) / "exp_infer"
     out_dir.mkdir(parents=True, exist_ok=True)
