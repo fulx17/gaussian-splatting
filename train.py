@@ -25,6 +25,18 @@ from arguments import ModelParams, PipelineParams, OptimizationParams
 
 from lpipsPyTorch import lpips
 
+import csv
+import random
+import torchvision
+from pathlib import Path
+from PIL import Image
+from torchvision.transforms.functional import to_tensor
+
+from render_scene import (
+    camera_from_csv_row, load_distortion_params,
+    load_undistorted_camera_params, redistort_and_crop,
+)
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -43,8 +55,123 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
+# test evaluation
+def load_gt_image(gt_dir, image_name, device):
+    """
+    GT nam trong test/images/, cung TEN GOC nhung duoi la .jpg (khac voi
+    duoi trong test_poses.csv). Khop theo STEM, khong khop nguyen ten file.
+    """
+    stem = Path(image_name).stem
+    gt_path = Path(gt_dir) / f"{stem}.jpg"
+    if not gt_path.exists():
+        return None
+    img = Image.open(gt_path).convert("RGB")
+    return to_tensor(img).to(device)
+
+
+def render_test_samples(dataset, gaussians, pipe, background, iteration,
+                         orig_dir, num_samples=15, seed=42, analyse_file=None):
+    """
+    Render mot mau co dinh (seed) tu test_poses.csv, redistort+crop ve dung
+    kich thuoc GT goc, so sanh voi GT that (test/images/*.jpg), ghi metric
+    ra analyse_file.
+    """
+    source_path = Path(dataset.source_path)
+    scene_name = source_path.name
+    input_dir = source_path.parent
+    test_poses_csv = source_path / "test" / "test_poses.csv"
+    gt_dir = source_path / "test" / "images"
+    if not test_poses_csv.exists():
+        return
+
+    dist = load_distortion_params(orig_dir, scene_name)
+    und = load_undistorted_camera_params(input_dir, scene_name)
+
+    with open(test_poses_csv, newline="") as f:
+        rows = list(csv.DictReader(f))
+    if not rows:
+        return
+
+    rng = random.Random(seed)
+    sample_rows = rng.sample(rows, min(num_samples, len(rows)))
+
+    out_dir = Path(dataset.model_path) / "test_renders" / f"iter_{iteration}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    device = dataset.data_device
+    l1_sum = ssim_sum = psnr_sum = lpips_sum = 0.0
+    n_scored = 0
+
+    with torch.no_grad():
+        for idx, row in enumerate(sample_rows):
+            camera = camera_from_csv_row(
+                row, idx, device,
+                width=und["width"], height=und["height"],
+                fx=und["f"], fy=und["f"],
+            )
+            rendering = render(
+                camera, gaussians, pipe, background,
+                use_trained_exp=dataset.train_test_exp,
+                separate_sh=SPARSE_ADAM_AVAILABLE,
+            )["render"]
+
+            if abs(dist["k"]) > 1e-8:
+                rendering = redistort_and_crop(
+                    rendering,
+                    f=und["f"], cx_render=und["cx"], cy_render=und["cy"],
+                    k=dist["k"], cx_orig=dist["cx"], cy_orig=dist["cy"],
+                    orig_w=dist["width"], orig_h=dist["height"],
+                )
+
+            torchvision.utils.save_image(rendering, out_dir / Path(row["image_name"]).name)
+
+            gt_image = load_gt_image(gt_dir, row["image_name"], device)
+            if gt_image is not None:
+                image_c = torch.clamp(rendering, 0.0, 1.0)
+                gt_image_c = torch.clamp(gt_image, 0.0, 1.0)
+                if image_c.shape != gt_image_c.shape:
+                    print(f"[TEST RENDER] Bo qua {row['image_name']}: "
+                          f"shape render {tuple(image_c.shape)} != GT "
+                          f"{tuple(gt_image_c.shape)}", flush=True)
+                else:
+                    l1_val = l1_loss(image_c, gt_image_c).item()
+                    ssim_val = ssim(image_c, gt_image_c).item()
+                    psnr_val = psnr(image_c, gt_image_c).mean().item()
+                    lpips_val = lpips(image_c.unsqueeze(0), gt_image_c.unsqueeze(0),
+                                       net_type='squeeze').item()
+                    psnr_norm = torch.clamp(torch.tensor(psnr_val / 40.0), 0.0, 1.0).item()
+                    score = 0.4 * (1 - lpips_val) + 0.3 * ssim_val + 0.3 * psnr_norm
+
+                    l1_sum += l1_val; ssim_sum += ssim_val
+                    psnr_sum += psnr_val; lpips_sum += lpips_val
+                    n_scored += 1
+
+            del camera, rendering
+
+    print(f"[TEST RENDER] Saved {len(sample_rows)} renders @ iter {iteration} -> {out_dir}", flush=True)
+
+    if n_scored > 0:
+        l1_avg = l1_sum / n_scored
+        ssim_avg = ssim_sum / n_scored
+        psnr_avg = psnr_sum / n_scored
+        lpips_avg = lpips_sum / n_scored
+        psnr_norm_avg = min(max(psnr_avg / 40.0, 0.0), 1.0)
+        score_avg = 0.4 * (1 - lpips_avg) + 0.3 * ssim_avg + 0.3 * psnr_norm_avg
+
+        print(f"[TEST ITER {iteration}] n={n_scored} L1={l1_avg:.4f} "
+              f"SSIM={ssim_avg:.4f} LPIPS={lpips_avg:.4f} PSNR={psnr_avg:.2f} "
+              f"score={score_avg:.4f}", flush=True)
+
+        if analyse_file is not None:
+            analyse_file.write(f"{iteration},{l1_avg:.6f},{ssim_avg:.6f},"
+                                f"{lpips_avg:.6f},{psnr_avg:.6f},{score_avg:.6f}\n")
+            analyse_file.flush()
+    else:
+        print(f"[TEST ITER {iteration}] Khong tim thay GT nao khop "
+              f"(kiem tra gt_dir: {gt_dir})", flush=True)
+
 # VAR: add cap max
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, cap_max=-1, analyse_path=None):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, cap_max=-1, analyse_path=None, orig_dir = None, test_render_every=50, test_render_samples=15):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
@@ -162,18 +289,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
 
-            if analyse_file is not None and iteration % 100 == 0:
-                image_c = torch.clamp(image, 0.0, 1.0)
-                gt_image_c = torch.clamp(gt_image, 0.0, 1.0)
-                psnr_val = psnr(image_c, gt_image_c).mean().item()
-                lpips_val = lpips(image_c.unsqueeze(0), gt_image_c.unsqueeze(0), net_type='squeeze').item()
-                l1_val = Ll1.item()
-                ssim_val = ssim_value.item()
-                psnr_norm = torch.clamp(torch.tensor(psnr_val / 40.0), 0.0, 1.0).item()
-                score = 0.4 * (1 - lpips_val) + 0.3 * ssim_val + 0.3 * psnr_norm
-                analyse_file.write(f"{iteration},{l1_val:.6f},{ssim_val:.6f},{lpips_val:.6f},{psnr_val:.6f},{score:.6f}\n")
-                analyse_file.flush()
-                print(f"[ITER {iteration}] L1={l1_val:.4f} SSIM={ssim_val:.4f} LPIPS={lpips_val:.4f} PSNR={psnr_val:.2f} score={score:.4f}", flush=True)
+            # VAR: render mau test that (co GT) va ghi metric
+            if orig_dir is not None and analyse_file is not None and iteration % test_render_every == 0:
+                render_test_samples(
+                    dataset, gaussians, pipe, background, iteration,
+                    orig_dir, num_samples=test_render_samples,
+                    analyse_file=analyse_file,
+                )
 
             if iteration % 10 == 0:
                 # VAR: log gaussians numbers 
@@ -307,6 +429,10 @@ if __name__ == "__main__":
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--cap_max", type=int, default=-1)
     parser.add_argument("--analyse", type=str, default=None, help="Đường dẫn file log điểm số. Không truyền = không log.")
+    parser.add_argument("--orig_dir", type=str, default=None,
+        help="Duong dan chua cameras.bin SIMPLE_RADIAL goc (truoc undistort), can de redistort anh test.")
+    parser.add_argument("--test_render_every", type=int, default=50)
+    parser.add_argument("--test_render_samples", type=int, default=15)
 
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
@@ -320,7 +446,6 @@ if __name__ == "__main__":
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.cap_max, args.analyse)
-    
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.cap_max, args.analyse, args.orig_dir, args.test_render_every, args.test_render_samples)
     # All done
     print("\nTraining complete.")
