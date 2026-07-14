@@ -420,8 +420,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     analyse_file.flush()
 
             # VAR: render 1 anh test co dinh moi 50 step (exp, khong can GT)
-            if orig_dir is not None and iteration % 50 == 0:
-                infer_one_test_image(dataset, gaussians, pipe, background, iteration, orig_dir)
+            # if orig_dir is not None and iteration % 50 == 0:
+            #     infer_one_test_image(dataset, gaussians, pipe, background, iteration, orig_dir)
 
             if iteration % 10 == 0:
                 # VAR: log gaussians numbers 
