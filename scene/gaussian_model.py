@@ -59,14 +59,16 @@ class GaussianModel:
         self._opacity = torch.empty(0)
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
+        self.xyz_gradient_accum_abs = None
         self.denom = torch.empty(0)
+        self.tmp_radii = None
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.setup_functions()
 
     def capture(self):
-        return (
+        base_state = (
             self.active_sh_degree,
             self._xyz,
             self._features_dc,
@@ -80,23 +82,52 @@ class GaussianModel:
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
         )
+        # Preserve the original 12-field checkpoint contract for baseline
+        # 3DGS and older tooling. Improved-GS appends its AbsGrad accumulator
+        # only when that state actually exists.
+        if self.xyz_gradient_accum_abs is None:
+            return base_state
+        return base_state + (self.xyz_gradient_accum_abs,)
     
     def restore(self, model_args, training_args):
-        (self.active_sh_degree, 
-        self._xyz, 
-        self._features_dc, 
-        self._features_rest,
-        self._scaling, 
-        self._rotation, 
-        self._opacity,
-        self.max_radii2D, 
-        xyz_gradient_accum, 
-        denom,
-        opt_dict, 
-        self.spatial_lr_scale) = model_args
+        # xyz_gradient_accum_abs was added after the October 2024 Graphdeco
+        # checkpoint format. Keep accepting existing checkpoints while saving
+        # the optional AbsGS accumulator in new ones.
+        if len(model_args) == 12:
+            (self.active_sh_degree,
+            self._xyz,
+            self._features_dc,
+            self._features_rest,
+            self._scaling,
+            self._rotation,
+            self._opacity,
+            self.max_radii2D,
+            xyz_gradient_accum,
+            denom,
+            opt_dict,
+            self.spatial_lr_scale) = model_args
+            xyz_gradient_accum_abs = None
+        elif len(model_args) == 13:
+            (self.active_sh_degree,
+            self._xyz,
+            self._features_dc,
+            self._features_rest,
+            self._scaling,
+            self._rotation,
+            self._opacity,
+            self.max_radii2D,
+            xyz_gradient_accum,
+            denom,
+            opt_dict,
+            self.spatial_lr_scale,
+            xyz_gradient_accum_abs) = model_args
+        else:
+            raise ValueError(f"Unsupported GaussianModel checkpoint format ({len(model_args)} entries)")
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
+        if xyz_gradient_accum_abs is not None:
+            self.xyz_gradient_accum_abs = xyz_gradient_accum_abs
         self.optimizer.load_state_dict(opt_dict)
 
     @property
@@ -178,6 +209,16 @@ class GaussianModel:
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        density_control = getattr(training_args, "density_control", None)
+        requested_absgrad = getattr(
+            training_args, "use_absgrad", getattr(training_args, "use_abs_grad", False)
+        )
+        use_absgrad = bool(requested_absgrad) and (
+            density_control is None or str(density_control).lower() == "improvedgs"
+        )
+        self.xyz_gradient_accum_abs = (
+            torch.zeros((self.get_xyz.shape[0], 1), device="cuda") if use_absgrad else None
+        )
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
         l = [
@@ -255,8 +296,12 @@ class GaussianModel:
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
 
-    def reset_opacity(self):
-        opacities_new = self.inverse_opacity_activation(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
+    def reset_opacity(self, max_opacity=0.01):
+        if not 0.0 < max_opacity < 1.0:
+            raise ValueError("max_opacity must be strictly between 0 and 1")
+        opacities_new = self.inverse_opacity_activation(
+            torch.clamp_max(self.get_opacity, max_opacity)
+        )
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
         self._opacity = optimizable_tensors["opacity"]
 
@@ -317,13 +362,15 @@ class GaussianModel:
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
             if group["name"] == name:
-                stored_state = self.optimizer.state.get(group['params'][0], None)
-                stored_state["exp_avg"] = torch.zeros_like(tensor)
-                stored_state["exp_avg_sq"] = torch.zeros_like(tensor)
-
-                del self.optimizer.state[group['params'][0]]
+                old_parameter = group['params'][0]
+                stored_state = self.optimizer.state.get(old_parameter, None)
+                if stored_state is not None:
+                    stored_state["exp_avg"] = torch.zeros_like(tensor)
+                    stored_state["exp_avg_sq"] = torch.zeros_like(tensor)
+                    del self.optimizer.state[old_parameter]
                 group["params"][0] = nn.Parameter(tensor.requires_grad_(True))
-                self.optimizer.state[group['params'][0]] = stored_state
+                if stored_state is not None:
+                    self.optimizer.state[group['params'][0]] = stored_state
 
                 optimizable_tensors[group["name"]] = group["params"][0]
         return optimizable_tensors
@@ -347,6 +394,12 @@ class GaussianModel:
         return optimizable_tensors
 
     def prune_points(self, mask):
+        mask = mask.to(device=self.get_xyz.device, dtype=torch.bool).reshape(-1)
+        if mask.shape[0] != self.get_xyz.shape[0]:
+            raise ValueError(
+                f"Prune mask has {mask.shape[0]} entries for {self.get_xyz.shape[0]} Gaussians"
+            )
+
         valid_points_mask = ~mask
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
 
@@ -357,11 +410,56 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
-        self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
+        if self.xyz_gradient_accum is not None and self.xyz_gradient_accum.shape[0] == mask.shape[0]:
+            self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
+        if self.xyz_gradient_accum_abs is not None and self.xyz_gradient_accum_abs.shape[0] == mask.shape[0]:
+            self.xyz_gradient_accum_abs = self.xyz_gradient_accum_abs[valid_points_mask]
+        if self.denom is not None and self.denom.shape[0] == mask.shape[0]:
+            self.denom = self.denom[valid_points_mask]
+        if self.max_radii2D is not None and self.max_radii2D.shape[0] == mask.shape[0]:
+            self.max_radii2D = self.max_radii2D[valid_points_mask]
+        if self.tmp_radii is not None and self.tmp_radii.shape[0] == mask.shape[0]:
+            self.tmp_radii = self.tmp_radii[valid_points_mask]
 
-        self.denom = self.denom[valid_points_mask]
-        self.max_radii2D = self.max_radii2D[valid_points_mask]
-        self.tmp_radii = self.tmp_radii[valid_points_mask]
+    def only_prune(self, value, percent=False):
+        """Prune Gaussians by activated opacity.
+
+        When ``percent`` is false, ``value`` is an absolute opacity threshold.
+        When it is true, ``value`` is the fraction of the lowest-opacity
+        Gaussians to remove (``20`` is also accepted as shorthand for ``0.20``).
+        Percentile pruning removes an exact count, including when opacities tie.
+        """
+        n_points = self.get_xyz.shape[0]
+        if n_points == 0:
+            return 0
+
+        opacity = self.get_opacity.detach().squeeze(-1)
+        if percent:
+            fraction = float(value)
+            if fraction > 1.0:
+                fraction /= 100.0
+            if not 0.0 <= fraction <= 1.0:
+                raise ValueError("Percentile prune fraction must be in [0, 1] (or [0, 100])")
+
+            # Keep at least one Gaussian so subsequent rendering/optimization
+            # remains well-defined even for an accidentally aggressive value.
+            prune_count = min(int(n_points * fraction), max(n_points - 1, 0))
+            if prune_count == 0:
+                return 0
+            prune_indices = torch.topk(opacity, prune_count, largest=False, sorted=False).indices
+            prune_mask = torch.zeros(n_points, dtype=torch.bool, device=self.get_xyz.device)
+            prune_mask[prune_indices] = True
+        else:
+            threshold = float(value)
+            if not 0.0 <= threshold <= 1.0:
+                raise ValueError("Absolute opacity prune threshold must be in [0, 1]")
+            prune_mask = opacity < threshold
+            prune_count = int(prune_mask.sum().item())
+            if prune_count == 0:
+                return 0
+
+        self.prune_points(prune_mask)
+        return prune_count
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -386,6 +484,7 @@ class GaussianModel:
         return optimizable_tensors
 
     def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii):
+        n_existing = self.get_xyz.shape[0]
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -401,10 +500,24 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
-        self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii))
-        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        if self.tmp_radii is not None:
+            if new_tmp_radii is None:
+                new_tmp_radii = torch.zeros(
+                    new_xyz.shape[0], dtype=self.tmp_radii.dtype, device=self.tmp_radii.device
+                )
+            self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii))
+        elif new_tmp_radii is not None:
+            existing_tmp_radii = torch.zeros(
+                n_existing, dtype=new_tmp_radii.dtype, device=new_tmp_radii.device
+            )
+            self.tmp_radii = torch.cat((existing_tmp_radii, new_tmp_radii))
+
+        device = self.get_xyz.device
+        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device=device)
+        if self.xyz_gradient_accum_abs is not None:
+            self.xyz_gradient_accum_abs = torch.zeros((self.get_xyz.shape[0], 1), device=device)
+        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device=device)
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device=device)
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
@@ -425,7 +538,9 @@ class GaussianModel:
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
-        new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(N)
+        new_tmp_radii = (
+            self.tmp_radii[selected_pts_mask].repeat(N) if self.tmp_radii is not None else None
+        )
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii)
 
@@ -445,9 +560,272 @@ class GaussianModel:
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
 
-        new_tmp_radii = self.tmp_radii[selected_pts_mask]
+        new_tmp_radii = self.tmp_radii[selected_pts_mask] if self.tmp_radii is not None else None
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
+
+    def _prepare_densification_scores(self, scores):
+        """Return one finite, non-negative score per current Gaussian."""
+        n_points = self.get_xyz.shape[0]
+        if scores is None:
+            accumulator = (
+                self.xyz_gradient_accum_abs
+                if self.xyz_gradient_accum_abs is not None
+                else self.xyz_gradient_accum
+            )
+            scores = accumulator / torch.clamp_min(self.denom, 1.0)
+
+        scores = torch.as_tensor(scores, device=self.get_xyz.device).detach()
+        if scores.ndim == 0:
+            scores = scores.reshape(1)
+        elif scores.ndim > 1:
+            if scores.shape[-1] == 1:
+                scores = scores.squeeze(-1)
+            else:
+                scores = torch.norm(scores, dim=-1)
+        scores = scores.reshape(-1)
+
+        padded_scores = torch.zeros(n_points, dtype=scores.dtype, device=self.get_xyz.device)
+        copy_count = min(n_points, scores.shape[0])
+        padded_scores[:copy_count] = scores[:copy_count]
+        return torch.nan_to_num(padded_scores, nan=0.0, posinf=0.0, neginf=0.0).clamp_min_(0.0)
+
+    def _weighted_candidate_mask(self, eligible_mask, weights, max_candidates):
+        """Sample at most ``max_candidates`` eligible points without replacement."""
+        weights = torch.nan_to_num(
+            weights.float(), nan=0.0, posinf=0.0, neginf=0.0
+        ).clamp_min_(0.0)
+        # EAS is a selector, not a quota: candidates with no positive edge
+        # contribution are not split merely to fill every available slot.
+        # When EAS is disabled, callers pass positive gradient magnitudes here.
+        eligible_mask = torch.logical_and(eligible_mask, weights > 0)
+        candidate_indices = torch.nonzero(eligible_mask, as_tuple=False).squeeze(-1)
+        candidate_count = candidate_indices.numel()
+        sample_count = min(max(int(max_candidates), 0), candidate_count)
+        selected_mask = torch.zeros_like(eligible_mask, dtype=torch.bool)
+
+        if sample_count == 0:
+            return selected_mask
+        if sample_count == candidate_count:
+            selected_mask[candidate_indices] = True
+            return selected_mask
+
+        candidate_weights = weights[candidate_indices]
+        sampled_local = torch.multinomial(
+            candidate_weights, sample_count, replacement=False
+        )
+        selected_mask[candidate_indices[sampled_local]] = True
+        return selected_mask
+
+    def _long_axis_split(self, selected_pts_mask, split_distance=0.45, opacity_reduction=0.6):
+        """Replace each selected Gaussian by the two Improved-GS LAS children."""
+        rho = float(split_distance)
+        if not 0.0 < rho < 1.0:
+            raise ValueError("split_distance must be strictly between 0 and 1")
+        opacity_reduction = float(opacity_reduction)
+        if not 0.0 < opacity_reduction <= 1.0:
+            raise ValueError("opacity_reduction must be in (0, 1]")
+
+        selected_pts_mask = selected_pts_mask.to(
+            device=self.get_xyz.device, dtype=torch.bool
+        ).reshape(-1)
+        n_selected = int(selected_pts_mask.sum().item())
+        if n_selected == 0:
+            return 0
+
+        parent_xyz = self.get_xyz[selected_pts_mask]
+        parent_scaling = self.get_scaling[selected_pts_mask]
+        parent_rotation = self._rotation[selected_pts_mask]
+        long_axis = torch.argmax(parent_scaling, dim=1, keepdim=True)
+        long_scale = torch.gather(parent_scaling, 1, long_axis)
+
+        # The paper parameterizes the child displacement in normalized
+        # Gaussian coordinates, hence the factor of 3 before rho * sigma_max.
+        local_offset = torch.zeros_like(parent_xyz)
+        local_offset.scatter_(1, long_axis, 3.0 * rho * long_scale)
+        rotation_matrices = build_rotation(parent_rotation)
+        world_offset = torch.bmm(rotation_matrices, local_offset.unsqueeze(-1)).squeeze(-1)
+        new_xyz = torch.cat((parent_xyz + world_offset, parent_xyz - world_offset), dim=0)
+
+        short_axis_factor = float(np.sqrt(1.0 - rho * rho))
+        child_scaling = parent_scaling * short_axis_factor
+        child_scaling.scatter_(1, long_axis, (1.0 - rho) * long_scale)
+        child_scaling = child_scaling.repeat(2, 1)
+        new_scaling = self.scaling_inverse_activation(child_scaling)
+
+        new_rotation = parent_rotation.repeat(2, 1)
+        new_features_dc = self._features_dc[selected_pts_mask].repeat(2, 1, 1)
+        new_features_rest = self._features_rest[selected_pts_mask].repeat(2, 1, 1)
+        child_opacity = self.get_opacity[selected_pts_mask] * opacity_reduction
+        opacity_epsilon = torch.finfo(child_opacity.dtype).eps
+        child_opacity = child_opacity.clamp(opacity_epsilon, 1.0 - opacity_epsilon)
+        new_opacity = self.inverse_opacity_activation(child_opacity).repeat(2, 1)
+        new_tmp_radii = (
+            self.tmp_radii[selected_pts_mask].repeat(2) if self.tmp_radii is not None else None
+        )
+
+        self.densification_postfix(
+            new_xyz,
+            new_features_dc,
+            new_features_rest,
+            new_opacity,
+            new_scaling,
+            new_rotation,
+            new_tmp_radii,
+        )
+
+        # Two children replace one parent: each selected point consumes exactly
+        # one slot from the active Gaussian budget.
+        child_mask = torch.zeros(
+            2 * n_selected, dtype=torch.bool, device=self.get_xyz.device
+        )
+        self.prune_points(torch.cat((selected_pts_mask, child_mask)))
+        return n_selected
+
+    def _random_split(self, selected_pts_mask, n_children=2):
+        """Apply the original 3DGS stochastic split to a preselected mask."""
+        selected_pts_mask = selected_pts_mask.to(
+            device=self.get_xyz.device, dtype=torch.bool
+        ).reshape(-1)
+        n_selected = int(selected_pts_mask.sum().item())
+        if n_selected == 0:
+            return 0
+        if n_children < 2:
+            raise ValueError("A split requires at least two children")
+
+        stds = self.get_scaling[selected_pts_mask].repeat(n_children, 1)
+        samples = torch.normal(mean=torch.zeros_like(stds), std=stds)
+        rotations = build_rotation(self._rotation[selected_pts_mask]).repeat(
+            n_children, 1, 1
+        )
+        new_xyz = (
+            torch.bmm(rotations, samples.unsqueeze(-1)).squeeze(-1)
+            + self.get_xyz[selected_pts_mask].repeat(n_children, 1)
+        )
+        new_scaling = self.scaling_inverse_activation(
+            self.get_scaling[selected_pts_mask].repeat(n_children, 1)
+            / (0.8 * n_children)
+        )
+        new_rotation = self._rotation[selected_pts_mask].repeat(n_children, 1)
+        new_features_dc = self._features_dc[selected_pts_mask].repeat(n_children, 1, 1)
+        new_features_rest = self._features_rest[selected_pts_mask].repeat(n_children, 1, 1)
+        new_opacity = self._opacity[selected_pts_mask].repeat(n_children, 1)
+        new_tmp_radii = (
+            self.tmp_radii[selected_pts_mask].repeat(n_children)
+            if self.tmp_radii is not None
+            else None
+        )
+
+        self.densification_postfix(
+            new_xyz,
+            new_features_dc,
+            new_features_rest,
+            new_opacity,
+            new_scaling,
+            new_rotation,
+            new_tmp_radii,
+        )
+        child_mask = torch.zeros(
+            n_children * n_selected, dtype=torch.bool, device=self.get_xyz.device
+        )
+        self.prune_points(torch.cat((selected_pts_mask, child_mask)))
+        return n_selected
+
+    def densify_and_split_improved(
+        self,
+        grad_values,
+        grad_threshold,
+        budget,
+        split_distance=0.45,
+        opacity_reduction=0.6,
+        sampling_weights=None,
+        eligible_mask=None,
+        use_las=True,
+    ):
+        """Budgeted, weighted Long-Axis Split used by Improved-GS."""
+        n_points = self.get_xyz.shape[0]
+        budget = int(budget)
+        available_slots = max(budget - n_points, 0)
+        if available_slots == 0 or n_points == 0:
+            return 0
+
+        grad_values = self._prepare_densification_scores(grad_values)
+        if eligible_mask is None:
+            eligible_mask = grad_values >= float(grad_threshold)
+        else:
+            eligible_mask = torch.as_tensor(
+                eligible_mask, device=self.get_xyz.device, dtype=torch.bool
+            ).reshape(-1)
+            if eligible_mask.shape[0] != n_points:
+                raise ValueError(
+                    f"Eligibility mask has {eligible_mask.shape[0]} entries for {n_points} Gaussians"
+                )
+            eligible_mask = torch.logical_and(
+                eligible_mask, grad_values >= float(grad_threshold)
+            )
+
+        weights = (
+            grad_values
+            if sampling_weights is None
+            else self._prepare_densification_scores(sampling_weights)
+        )
+        selected_pts_mask = self._weighted_candidate_mask(
+            eligible_mask, weights, available_slots
+        )
+        if use_las:
+            return self._long_axis_split(
+                selected_pts_mask,
+                split_distance=split_distance,
+                opacity_reduction=opacity_reduction,
+            )
+        return self._random_split(selected_pts_mask, n_children=2)
+
+    def densify_and_prune_improved(self, scores, min_opacity, budget, opt, iteration, extent):
+        """Run Improved-GS LAS under a hard budget, then opacity pruning.
+
+        ``iteration`` and ``extent`` intentionally remain in this interface so
+        the training loop can share its density-control call site with 3DGS;
+        the new LAS rule itself does not use scene extent.
+        """
+        del extent
+        before = self.get_xyz.shape[0]
+        use_absgrad = getattr(opt, "use_absgrad", getattr(opt, "use_abs_grad", False))
+        if use_absgrad:
+            if self.xyz_gradient_accum_abs is None:
+                raise RuntimeError(
+                    "use_absgrad is enabled but no absolute-gradient statistics were accumulated"
+                )
+            gradient_accumulator = self.xyz_gradient_accum_abs
+        else:
+            gradient_accumulator = self.xyz_gradient_accum
+        grad_values = gradient_accumulator / torch.clamp_min(self.denom, 1.0)
+
+        grad_threshold = getattr(opt, "improvedgs_grad_threshold", 0.0003)
+        split_distance = getattr(opt, "split_distance", 0.45)
+        opacity_reduction = getattr(opt, "opacity_reduction", 0.6)
+        use_las = getattr(opt, "use_las", True)
+
+        split_count = self.densify_and_split_improved(
+            grad_values=grad_values,
+            grad_threshold=grad_threshold,
+            budget=budget,
+            split_distance=split_distance,
+            opacity_reduction=opacity_reduction,
+            sampling_weights=scores,
+            use_las=use_las,
+        )
+        pruned_count = self.only_prune(min_opacity, percent=False)
+        self.tmp_radii = None
+        torch.cuda.empty_cache()
+
+        return {
+            "iteration": int(iteration),
+            "before": int(before),
+            "split": int(split_count),
+            "pruned": int(pruned_count),
+            "after": int(self.get_xyz.shape[0]),
+            "budget": int(budget),
+        }
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
         grads = self.xyz_gradient_accum / self.denom
@@ -470,4 +848,36 @@ class GaussianModel:
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
+        self.denom[update_filter] += 1
+
+    def add_densification_stats_abs(self, viewspace_point_tensor, update_filter):
+        """Accumulate both signed and per-pixel absolute screen-space gradients.
+
+        The modified Improved-GS rasterizer stores the conventional signed
+        gradient in channels 0:2 and AbsGS' accumulated absolute gradient in
+        channels 2:4. Call this instead of ``add_densification_stats`` (not in
+        addition to it), because this method increments the shared denominator.
+        """
+        if viewspace_point_tensor.grad is None:
+            raise RuntimeError("View-space point gradients are unavailable; call after backward()")
+        if viewspace_point_tensor.grad.shape[-1] < 4:
+            raise RuntimeError(
+                "AbsGrad requires an Improved-GS rasterizer that returns four "
+                "view-space gradient channels"
+            )
+        if (
+            self.xyz_gradient_accum_abs is None
+            or self.xyz_gradient_accum_abs.shape[0] != self.get_xyz.shape[0]
+        ):
+            self.xyz_gradient_accum_abs = torch.zeros(
+                (self.get_xyz.shape[0], 1), device=self.get_xyz.device
+            )
+
+        gradients = viewspace_point_tensor.grad
+        self.xyz_gradient_accum[update_filter] += torch.norm(
+            gradients[update_filter, :2], dim=-1, keepdim=True
+        )
+        self.xyz_gradient_accum_abs[update_filter] += torch.norm(
+            gradients[update_filter, 2:4], dim=-1, keepdim=True
+        )
         self.denom[update_filter] += 1

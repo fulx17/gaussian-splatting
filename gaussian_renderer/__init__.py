@@ -15,7 +15,11 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False):
+IMPROVED_GS_RASTERIZER_AVAILABLE = (
+    "pixel_weights" in getattr(GaussianRasterizationSettings, "_fields", ())
+)
+
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False, track_gradients=True, pixel_weights=None):
     """
     Render the scene. 
     
@@ -23,17 +27,37 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     """
  
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
-    screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
-    try:
-        screenspace_points.retain_grad()
-    except:
-        pass
+    # Channels 0-1 receive the standard signed screen-space gradient.  The
+    # CUDA backward pass writes the sum of per-pixel absolute gradients into
+    # channels 2-3 for AbsGS/Improved-GS densification.
+    screenspace_points = torch.zeros(
+        (
+            pc.get_xyz.shape[0],
+            4 if IMPROVED_GS_RASTERIZER_AVAILABLE else 3,
+        ),
+        dtype=pc.get_xyz.dtype,
+        requires_grad=track_gradients,
+        device=pc.get_xyz.device,
+    )
+    if track_gradients:
+        try:
+            screenspace_points.retain_grad()
+        except Exception:
+            pass
 
     # Set up rasterization configuration
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
 
-    raster_settings = GaussianRasterizationSettings(
+    if pixel_weights is not None:
+        if not IMPROVED_GS_RASTERIZER_AVAILABLE:
+            raise RuntimeError(
+                "pixel_weights requires the tracked Improved-GS rasterizer "
+                "patch and a rebuilt CUDA extension"
+            )
+        pixel_weights = pixel_weights.to(device=pc.get_xyz.device, dtype=torch.float32)
+
+    raster_settings_args = dict(
         image_height=int(viewpoint_camera.image_height),
         image_width=int(viewpoint_camera.image_width),
         tanfovx=tanfovx,
@@ -46,8 +70,11 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
         debug=pipe.debug,
-        antialiasing=pipe.antialiasing
+        antialiasing=pipe.antialiasing,
     )
+    if IMPROVED_GS_RASTERIZER_AVAILABLE:
+        raster_settings_args["pixel_weights"] = pixel_weights
+    raster_settings = GaussianRasterizationSettings(**raster_settings_args)
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
@@ -88,7 +115,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
     if separate_sh:
-        rendered_image, radii, depth_image = rasterizer(
+        raster_outputs = rasterizer(
             means3D = means3D,
             means2D = means2D,
             dc = dc,
@@ -99,7 +126,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             rotations = rotations,
             cov3D_precomp = cov3D_precomp)
     else:
-        rendered_image, radii, depth_image = rasterizer(
+        raster_outputs = rasterizer(
             means3D = means3D,
             means2D = means2D,
             shs = shs,
@@ -108,6 +135,12 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             scales = scales,
             rotations = rotations,
             cov3D_precomp = cov3D_precomp)
+
+    if pixel_weights is None:
+        rendered_image, radii, depth_image = raster_outputs
+        accum_weights = None
+    else:
+        rendered_image, radii, depth_image, accum_weights = raster_outputs
         
     # Apply exposure to rendered image (training only)
     if use_trained_exp:
@@ -124,5 +157,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         "radii": radii,
         "depth" : depth_image
         }
+    if accum_weights is not None and accum_weights.numel() > 0:
+        out["accum_weights"] = accum_weights
     
     return out

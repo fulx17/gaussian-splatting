@@ -97,6 +97,36 @@ class OptimizationParams(ParamGroup):
         self.depth_l1_weight_final = 0.01
         self.random_background = False
         self.optimizer_type = "default"
+
+        # ImprovedGS is opt-in so the default 3DGS training path remains
+        # unchanged. Component switches intentionally use integer 0/1 values:
+        # ParamGroup's store_true handling cannot disable a default-true bool.
+        self.density_control = "3dgs"
+        self.use_las = 1
+        self.use_rap = 1
+        self.use_gc = 1
+        self.use_absgrad = 1
+        self.use_eas = 1
+        self.use_mu = 1
+        self.gaussian_budget = 1_500_000
+        self.improvedgs_grad_threshold = 0.0003
+        self.min_opacity = 0.005
+        self.split_distance = 0.45
+        self.opacity_reduction = 0.6
+        self.budget_warmup_until_offset = 500
+        self.improvedgs_reset_max_opacity = 0.05
+        self.rap_initial_prune = 1
+        self.rap_initial_prune_iter = 300
+        self.rap_initial_prune_opacity = 0.02
+        self.rap_prune_ratio = 0.20
+        self.rap_prune_offset = 300
+        self.rap_rounds = 2
+        self.edge_sample_cams = 10
+        self.edge_mask_erosion = 1
+        self.mu_start_iter = 15_000
+        self.mu_interval = 5
+        self.mu_second_start_iter = 22_500
+        self.mu_second_interval = 20
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

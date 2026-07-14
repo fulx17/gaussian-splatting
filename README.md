@@ -37,6 +37,11 @@ This research was funded by the ERC Advanced grant FUNGRAPH No 788065. The autho
 
 ## NEW FEATURES !
 
+This competition fork also includes an opt-in **Improved-GS** density-control
+pipeline (LAS, RAP, Growth Control, AbsGrad, EAS, and MU). Fresh clones must
+apply and rebuild the tracked rasterizer patch before enabling it; see
+[docs/IMPROVED_GS.md](docs/IMPROVED_GS.md) for setup, flags, and Kaggle usage.
+
 We have limited resources for maintaining and updating the code. However, we have added a few new features since the original release that are inspired by some of the excellent work many other researchers have been doing on 3DGS. We will be adding other features within the ability of our resources.
 
 **Update of October 2024**: We integrated [training speed acceleration](#training-speed-acceleration) and made it compatible with [depth regularization](#depth-regularization), [anti-aliasing](#anti-aliasing) and [exposure compensation](#exposure-compensation). We have enhanced the SIBR real time viewer by correcting bugs and adding features in the [Top View](#sibr-top-view) that allows visualization of input and user cameras.
