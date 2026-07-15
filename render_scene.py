@@ -14,6 +14,7 @@ from gaussian_renderer import GaussianModel, render
 from scene.cameras import Camera
 from scene.colmap_loader import qvec2rotmat, read_intrinsics_binary
 from utils.graphics_utils import focal2fov
+from utils.image_utils import save_render_jpeg
 from utils.system_utils import searchForMaxIteration
 from utils.general_utils import safe_state
 import torch.nn.functional as F
@@ -323,7 +324,7 @@ def render_scene(dataset, pipeline, input_dir ,output_dir, scene_name, iteration
                 #     torchvision.utils.save_image(rendering, "/kaggle/working/debug_after_redistort.png")
 
             out_path = scene_dir / row["image_name"]
-            torchvision.utils.save_image(rendering, out_path)
+            save_render_jpeg(rendering, out_path, quality=95)
             del camera, rendering
 
     print(f"Rendered {len(rows)} images for {scene_name} from iteration {loaded_iter} -> {scene_dir}")
