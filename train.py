@@ -10,6 +10,7 @@
 #
 
 import os
+import numpy as np
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim
@@ -55,42 +56,59 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
-# test evaluation
+# VAR: HF quintile evaluation
 def load_gt_image(gt_dir, image_name, device):
-    """
-    GT nam trong test/images/, cung TEN GOC nhung duoi co the khac
-    (vd .JPG thay vi .jpg trong CSV). Khop theo STEM, thu nhieu bien
-    the duoi file khong phan biet hoa/thuong.
-    """
     stem = Path(image_name).stem
     gt_dir = Path(gt_dir)
-
     for ext in (".jpg", ".JPG", ".jpeg", ".JPEG", ".png", ".PNG"):
         gt_path = gt_dir / f"{stem}{ext}"
         if gt_path.exists():
             img = Image.open(gt_path).convert("RGB")
             return to_tensor(img).to(device)
-
     return None
 
 
-def render_test_samples(dataset, gaussians, pipe, background, iteration,
-                         orig_dir, num_samples=15, seed=42, analyse_file=None):
-    """
-    Render mot mau co dinh (seed) tu test_poses.csv, redistort+crop ve dung
-    kich thuoc GT goc, so sanh voi GT that (test/images/*.jpg), ghi metric
-    ra analyse_file.
-    """
+def load_hf_map(hf_masks_dir, image_name):
+    stem = Path(image_name).stem
+    hf_path = Path(hf_masks_dir) / f"{stem}_highfreq.png"
+    if not hf_path.exists():
+        return None
+    return np.array(Image.open(hf_path).convert("L"), dtype=np.float32)
+
+
+def compute_hf_metrics(gt, render, hf_map):
+    """gt, render: CxHxW tensor [0,1]; hf_map: HxW numpy [0,255]. Return (losses[5], contribs[5])."""
+    E = (gt - render).abs().mean(dim=0).detach().cpu().numpy()  # HxW L1
+    qs = np.percentile(hf_map, [20, 40, 60, 80])
+    bounds = [-1.0] + list(qs) + [256.0]
+    total_E = E.sum() + 1e-8
+    losses, contribs = [], []
+    for k in range(5):
+        mask = (hf_map > bounds[k]) & (hf_map <= bounds[k + 1])
+        if mask.sum() == 0:
+            losses.append(0.0); contribs.append(0.0); continue
+        losses.append(float(E[mask].mean()))
+        contribs.append(float(E[mask].sum() / total_E))
+    return losses, contribs
+
+
+def evaluate_hf(dataset, gaussians, pipe, background, iteration,
+                 orig_dir, hf_masks_dir, hf_log_csv,
+                 num_samples=20, seed=42):
+    """Render sample cố định tu test_poses.csv, redistort ve dung size GT,
+    tinh HF quintile L1 loss/contribution, ghi 1 dong vao hf_log_csv."""
     source_path = Path(dataset.source_path)
     scene_name = source_path.parent.name
     input_dir = source_path.parent.parent
+    scene_dir = input_dir / scene_name
 
-    scene_dir = input_dir / scene_name  
     test_poses_csv = scene_dir / "test" / "test_poses.csv"
     gt_dir = scene_dir / "test" / "images"
+    if hf_masks_dir is None:
+        hf_masks_dir = scene_dir / "test" / "hf_masks"
 
     if not test_poses_csv.exists():
-        print(f"[TEST RENDER] Khong tim thay {test_poses_csv}, bo qua test render.", flush=True)
+        print(f"[HF EVAL] Khong tim thay {test_poses_csv}, bo qua.", flush=True)
         return
 
     dist = load_distortion_params(orig_dir, scene_name)
@@ -104,12 +122,10 @@ def render_test_samples(dataset, gaussians, pipe, background, iteration,
     rng = random.Random(seed)
     sample_rows = rng.sample(rows, min(num_samples, len(rows)))
 
-    out_dir = Path(dataset.model_path) / "test_renders" / f"iter_{iteration}"
-    out_dir.mkdir(parents=True, exist_ok=True)
-
     device = dataset.data_device
-    l1_sum = ssim_sum = psnr_sum = lpips_sum = 0.0
-    n_scored = 0
+    hf_losses_sum = [0.0] * 5
+    hf_contribs_sum = [0.0] * 5
+    n_hf = 0
 
     with torch.no_grad():
         for idx, row in enumerate(sample_rows):
@@ -132,155 +148,56 @@ def render_test_samples(dataset, gaussians, pipe, background, iteration,
                     orig_w=dist["width"], orig_h=dist["height"],
                 )
 
-            torchvision.utils.save_image(rendering, out_dir / Path(row["image_name"]).name)
-
             gt_image = load_gt_image(gt_dir, row["image_name"], device)
-            if gt_image is not None:
-                image_c = torch.clamp(rendering, 0.0, 1.0)
-                gt_image_c = torch.clamp(gt_image, 0.0, 1.0)
-                if image_c.shape != gt_image_c.shape:
-                    print(f"[TEST RENDER] Bo qua {row['image_name']}: "
-                          f"shape render {tuple(image_c.shape)} != GT "
-                          f"{tuple(gt_image_c.shape)}", flush=True)
-                else:
-                    l1_val = l1_loss(image_c, gt_image_c).item()
-                    ssim_val = ssim(image_c, gt_image_c).item()
-                    psnr_val = psnr(image_c, gt_image_c).mean().item()
-                    lpips_val = lpips(image_c.unsqueeze(0), gt_image_c.unsqueeze(0),
-                                       net_type='squeeze').item()
-                    psnr_norm = torch.clamp(torch.tensor(psnr_val / 40.0), 0.0, 1.0).item()
-                    score = 0.4 * (1 - lpips_val) + 0.3 * ssim_val + 0.3 * psnr_norm
+            hf_map = load_hf_map(hf_masks_dir, row["image_name"])
 
-                    l1_sum += l1_val; ssim_sum += ssim_val
-                    psnr_sum += psnr_val; lpips_sum += lpips_val
-                    n_scored += 1
+            if gt_image is None or hf_map is None:
+                del camera, rendering
+                continue
+
+            image_c = torch.clamp(rendering, 0.0, 1.0)
+            gt_image_c = torch.clamp(gt_image, 0.0, 1.0)
+
+            if image_c.shape != gt_image_c.shape or hf_map.shape != image_c.shape[-2:]:
+                print(f"[HF EVAL] Bo qua {row['image_name']}: shape khong khop.", flush=True)
+                del camera, rendering
+                continue
+
+            hf_l, hf_c = compute_hf_metrics(gt_image_c, image_c, hf_map)
+            for k in range(5):
+                hf_losses_sum[k] += hf_l[k]
+                hf_contribs_sum[k] += hf_c[k]
+            n_hf += 1
 
             del camera, rendering
 
-    print(f"[TEST RENDER] Saved {len(sample_rows)} renders @ iter {iteration} -> {out_dir}", flush=True)
-
-    if n_scored > 0:
-        l1_avg = l1_sum / n_scored
-        ssim_avg = ssim_sum / n_scored
-        psnr_avg = psnr_sum / n_scored
-        lpips_avg = lpips_sum / n_scored
-        psnr_norm_avg = min(max(psnr_avg / 40.0, 0.0), 1.0)
-        score_avg = 0.4 * (1 - lpips_avg) + 0.3 * ssim_avg + 0.3 * psnr_norm_avg
-
-        print(f"[TEST ITER {iteration}] n={n_scored} L1={l1_avg:.4f} "
-              f"SSIM={ssim_avg:.4f} LPIPS={lpips_avg:.4f} PSNR={psnr_avg:.2f} "
-              f"score={score_avg:.4f}", flush=True)
-
-        if analyse_file is not None:
-            analyse_file.write(f"{iteration},{l1_avg:.6f},{ssim_avg:.6f},"
-                                f"{lpips_avg:.6f},{psnr_avg:.6f},{score_avg:.6f}\n")
-            analyse_file.flush()
-    else:
-        print(f"[TEST ITER {iteration}] Khong tim thay GT nao khop "
-              f"(kiem tra gt_dir: {gt_dir})", flush=True)
-
-def infer_one_test_image(dataset, gaussians, pipe, background, iteration, orig_dir,
-                          fixed_image_name="DJI_20241229123233_0050_V.JPG"):
-    """
-    EXP: render 1 anh CO DINH (theo ten fixed_image_name) de theo doi truc quan
-    qua trinh train. Ten anh HARD-CODE trong ham, khong can them CLI arg vi
-    day chi la thu nghiem.
-    """
-    source_path = Path(dataset.source_path)
-    scene_name = source_path.parent.name
-    input_dir = source_path.parent.parent
-    scene_dir = input_dir / scene_name
-    test_poses_csv = scene_dir / "test" / "test_poses.csv"
-    if not test_poses_csv.exists() or orig_dir is None:
+    if n_hf == 0:
+        print(f"[HF EVAL] Khong co anh nao khop GT/HF mask (gt_dir={gt_dir}, hf_masks_dir={hf_masks_dir})", flush=True)
         return
 
-    dist = load_distortion_params(orig_dir, scene_name)
-    und = load_undistorted_camera_params(input_dir, scene_name)
+    avg_losses = [v / n_hf for v in hf_losses_sum]
+    avg_contribs = [v / n_hf for v in hf_contribs_sum]
 
-    with open(test_poses_csv, newline="") as f:
-        rows = list(csv.DictReader(f))
-    if not rows:
-        return
+    write_header = not os.path.exists(hf_log_csv)
+    out_dir = os.path.dirname(hf_log_csv)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    with open(hf_log_csv, "a", newline="") as f:
+        if write_header:
+            f.write("iter,Q1_loss,Q2_loss,Q3_loss,Q4_loss,Q5_loss,"
+                     "Q1_contrib,Q2_contrib,Q3_contrib,Q4_contrib,Q5_contrib\n")
+        row_vals = [str(iteration)] + [f"{v:.6f}" for v in avg_losses] + [f"{v:.6f}" for v in avg_contribs]
+        f.write(",".join(row_vals) + "\n")
 
-    # EXP: tim dung row theo ten anh co dinh, fallback ve rows[0] neu khong thay
-    row = next((r for r in rows if r["image_name"] == fixed_image_name), None)
-    if row is None:
-        print(f"[EXP INFER] Khong tim thay image_name={fixed_image_name} trong "
-              f"test_poses.csv, dung rows[0] thay the.", flush=True)
-        row = rows[0]
-
-    out_dir = Path(dataset.model_path) / "exp_infer"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"iter_{iteration:06d}.png"
-
-    with torch.no_grad():
-        camera = camera_from_csv_row(
-            row, 0, dataset.data_device,
-            width=und["width"], height=und["height"],
-            fx=und["f"], fy=und["f"],
-        )
-        rendering = render(
-            camera, gaussians, pipe, background,
-            use_trained_exp=dataset.train_test_exp,
-            separate_sh=SPARSE_ADAM_AVAILABLE,
-        )["render"]
-
-        if abs(dist["k"]) > 1e-8:
-            rendering = redistort_and_crop(
-                rendering,
-                f=und["f"], cx_render=und["cx"], cy_render=und["cy"],
-                k=dist["k"], cx_orig=dist["cx"], cy_orig=dist["cy"],
-                orig_w=dist["width"], orig_h=dist["height"],
-            )
-        torchvision.utils.save_image(rendering, out_path)
-        del camera, rendering
-
-    print(f"[EXP INFER] Saved {out_path}", flush=True)
-
-def compute_component_gradnorm(loss_term, params):
-    """
-    Tinh L2-gradnorm cua 1 loss component rieng le, KHONG lam ban optimizer
-    (dung autograd.grad thay vi backward()). retain_graph=True de giu graph
-    cho cac lan goi tiep theo va backward() tong cuoi cung.
-    """
-    if not torch.is_tensor(loss_term) or not loss_term.requires_grad:
-        return 0.0
-    grads = torch.autograd.grad(loss_term, params, retain_graph=True, allow_unused=True)
-    total_sq = 0.0
-    for g in grads:
-        if g is not None:
-            total_sq += g.detach().float().pow(2).sum().item()
-    return total_sq ** 0.5
+    print(f"[HF EVAL] iter={iteration} n={n_hf} Q1_loss={avg_losses[0]:.4f} Q5_loss={avg_losses[4]:.4f}", flush=True)
 
 # VAR: add cap max
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, cap_max=-1, analyse_path=None, orig_dir = None, test_render_every=50, test_render_samples=15, lambda_lpips=0.15):
-
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, cap_max=-1, analyse_path=None, orig_dir = None, test_render_every=50, test_render_samples=15, lambda_lpips=0.15, hf_masks_dir=None, hf_log_csv="/kaggle/working/HFlog.csv", hf_eval_every=50):
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
 
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
-
-    #VAR: add logger
-    # analyse_file = None
-    # if analyse_path is not None:
-    #     out_dir = os.path.dirname(analyse_path)
-    #     if out_dir:
-    #         os.makedirs(out_dir, exist_ok=True)
-    #     analyse_file = open(analyse_path, "w")
-    #     analyse_file.write("iteration,L1,SSIM,LPIPS,PSNR,score\n")
-
-    #VAR: analyse_file gio dung de log per-step (L1, SSIM, depth, LPIPS + gradnorm)
-    analyse_file = None
-    if analyse_path is not None:
-        out_dir = os.path.dirname(analyse_path)
-        if out_dir:
-            os.makedirs(out_dir, exist_ok=True)
-        analyse_file = open(analyse_path, "w")
-        analyse_file.write(
-            "iteration,L1,SSIM_loss,Depth,LPIPS,"
-            "L1_gradnorm,SSIM_gradnorm,Depth_gradnorm,LPIPS_gradnorm\n"
-        )
 
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
@@ -358,12 +275,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             ssim_value = ssim(image, gt_image)
 
-        #VAR: new loss
-        lpips_value = lpips(image.unsqueeze(0), gt_image.unsqueeze(0), net_type='squeeze')
-
-        loss = ((1.0 - opt.lambda_dssim - lambda_lpips) * Ll1
-                + opt.lambda_dssim * (1.0 - ssim_value)
-                + lambda_lpips * lpips_value)
+        loss = (1.0 - opt.lambda_dssim ) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
         # Depth regularization
         Ll1depth_pure = 0.0
@@ -380,48 +292,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             Ll1depth = 0
         
 
-        # VAR: tinh gradnorm rieng cho tung loss component (TRUOC khi loss.backward() tong)
-        grad_params = [p for group in gaussians.optimizer.param_groups for p in group['params']]
-
-        l1_gradnorm = compute_component_gradnorm(Ll1, grad_params)
-        ssim_gradnorm = compute_component_gradnorm(1.0 - ssim_value, grad_params)
-        depth_gradnorm = compute_component_gradnorm(
-            Ll1depth_pure if torch.is_tensor(Ll1depth_pure) else torch.tensor(0.0), grad_params
-        )
-        lpips_gradnorm = compute_component_gradnorm(lpips_value, grad_params)
-
         loss.backward()
 
         iter_end.record()
 
         with torch.no_grad():
 
+            # VAR: HF quintile evaluation trigger
+            if orig_dir is not None and iteration % hf_eval_every == 0:
+                evaluate_hf(
+                    dataset, gaussians, pipe, background, iteration,
+                    orig_dir=orig_dir, hf_masks_dir=hf_masks_dir, hf_log_csv=hf_log_csv,
+                )
+
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
-
-            # VAR: render mau test that (co GT) va ghi metric
-            # if orig_dir is not None and analyse_file is not None and iteration % test_render_every == 0:
-            #     render_test_samples(
-            #         dataset, gaussians, pipe, background, iteration,
-            #         orig_dir, num_samples=test_render_samples,
-            #         analyse_file=analyse_file,
-            #     )
-            # VAR: log moi step vao analyse_file (L1, SSIM, depth, LPIPS + gradnorm)
-            if analyse_file is not None:
-                depth_val = Ll1depth_pure.item() if torch.is_tensor(Ll1depth_pure) else float(Ll1depth_pure)
-                analyse_file.write(
-                    f"{iteration},{Ll1.item():.6f},{(1.0 - ssim_value).item():.6f},"
-                    f"{depth_val:.6f},{lpips_value.item():.6f},"
-                    f"{l1_gradnorm:.6f},{ssim_gradnorm:.6f},"
-                    f"{depth_gradnorm:.6f},{lpips_gradnorm:.6f}\n"
-                )
-                if iteration % 50 == 0:
-                    analyse_file.flush()
-
-            # VAR: render 1 anh test co dinh moi 50 step (exp, khong can GT)
-            # if orig_dir is not None and iteration % 50 == 0:
-            #     infer_one_test_image(dataset, gaussians, pipe, background, iteration, orig_dir)
 
             if iteration % 10 == 0:
                 # VAR: log gaussians numbers 
@@ -472,8 +358,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
-    if analyse_file is not None:
-        analyse_file.close()
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -559,6 +443,10 @@ if __name__ == "__main__":
         help="Duong dan chua cameras.bin SIMPLE_RADIAL goc (truoc undistort), can de redistort anh test.")
     parser.add_argument("--test_render_every", type=int, default=50)
     parser.add_argument("--test_render_samples", type=int, default=15)
+    parser.add_argument("--hf_masks_dir", type=str, default=None,
+        help="Duong dan test/hf_masks chua *_highfreq.png (mac dinh: <scene>/test/hf_masks)")
+    parser.add_argument("--hf_log_csv", type=str, default="/kaggle/working/HFlog.csv")
+    parser.add_argument("--hf_eval_every", type=int, default=50)
 
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
@@ -572,6 +460,6 @@ if __name__ == "__main__":
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.cap_max, args.analyse, args.orig_dir, args.test_render_every, args.test_render_samples)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.cap_max, args.analyse, args.orig_dir, args.test_render_every, args.test_render_samples, hf_masks_dir=args.hf_masks_dir, hf_log_csv=args.hf_log_csv, hf_eval_every=args.hf_eval_every)
     # All done
     print("\nTraining complete.")
