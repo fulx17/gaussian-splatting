@@ -1,11 +1,11 @@
 import csv
+import math
 import os
 from argparse import ArgumentParser
 from pathlib import Path
 
 import numpy as np
 import torch
-import torchvision
 from PIL import Image
 from tqdm import tqdm
 
@@ -109,19 +109,26 @@ def load_undistorted_camera_params(input_dir, scene_name):
                 width=cam.width, height=cam.height)
 
 
-def redistort_image(img, f, cx, cy, k, num_iters=15):
-    """img: tensor [C,H,W] (anh render "undistorted", canvas mo rong) -> anh da meo theo k.
+def _validate_interpolation(interpolation):
+    if interpolation not in ("bilinear", "bicubic"):
+        raise ValueError(
+            "redistort interpolation must be 'bilinear' or 'bicubic', "
+            f"got {interpolation!r}"
+        )
 
-    Giai nguoc r_d = r_u + k*r_u^3 bang Newton's method tren ban kinh (giong het
-    experiment_distort.py) -- on dinh hon fixed-point iteration cu tren x,y rieng le,
-    dac biet o vung ria canvas mo rong hoac khi k lon.
-    """
-    C, H, W = img.shape
-    device = img.device
+
+def build_redistortion_grid(height, width, f, cx, cy, k, device, num_iters=15):
+    """Build the camera-dependent sampling grid shared by every scene view."""
+    if height <= 1 or width <= 1:
+        raise ValueError(f"Redistortion grid requires H,W > 1, got {height}x{width}")
+    if not math.isfinite(float(f)) or float(f) <= 0.0:
+        raise ValueError(f"Focal length must be positive and finite, got {f}")
+    if int(num_iters) <= 0:
+        raise ValueError(f"num_iters must be positive, got {num_iters}")
 
     ys, xs = torch.meshgrid(
-        torch.arange(H, device=device, dtype=torch.float32),
-        torch.arange(W, device=device, dtype=torch.float32),
+        torch.arange(height, device=device, dtype=torch.float32),
+        torch.arange(width, device=device, dtype=torch.float32),
         indexing="ij",
     )
     xd = (xs - cx) / f
@@ -129,32 +136,155 @@ def redistort_image(img, f, cx, cy, k, num_iters=15):
     rd = torch.sqrt(xd * xd + yd * yd)
 
     ru = rd.clone()
-    for _ in range(num_iters):
+    for _ in range(int(num_iters)):
         g = k * ru**3 + ru - rd
         g_prime = 3 * k * ru**2 + 1
-        g_prime = torch.where(g_prime.abs() < 1e-12, torch.full_like(g_prime, 1e-12), g_prime)
+        g_prime = torch.where(
+            g_prime.abs() < 1e-12,
+            torch.full_like(g_prime, 1e-12),
+            g_prime,
+        )
         ru = ru - g / g_prime
 
     scale = torch.where(rd > 1e-12, ru / rd, torch.ones_like(rd))
+    u_src = xd * scale * f + cx
+    v_src = yd * scale * f + cy
 
-    xu = xd * scale
-    yu = yd * scale
+    grid_x = (u_src / (width - 1)) * 2 - 1
+    grid_y = (v_src / (height - 1)) * 2 - 1
+    return torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
 
-    u_src = xu * f + cx
-    v_src = yu * f + cy
 
-    grid_x = (u_src / (W - 1)) * 2 - 1
-    grid_y = (v_src / (H - 1)) * 2 - 1
-    grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
+def redistort_image(
+    img,
+    f,
+    cx,
+    cy,
+    k,
+    num_iters=15,
+    interpolation="bilinear",
+    grid=None,
+):
+    """img: tensor [C,H,W] (anh render "undistorted", canvas mo rong) -> anh da meo theo k.
+
+    Giai nguoc r_d = r_u + k*r_u^3 bang Newton's method tren ban kinh (giong het
+    experiment_distort.py) -- on dinh hon fixed-point iteration cu tren x,y rieng le,
+    dac biet o vung ria canvas mo rong hoac khi k lon.
+    """
+    if img.ndim != 3:
+        raise ValueError(f"Expected CHW image, got shape {tuple(img.shape)}")
+    _validate_interpolation(interpolation)
+
+    _, height, width = img.shape
+    if grid is None:
+        grid = build_redistortion_grid(
+            height,
+            width,
+            f=f,
+            cx=cx,
+            cy=cy,
+            k=k,
+            device=img.device,
+            num_iters=num_iters,
+        )
+    expected_grid_shape = (1, height, width, 2)
+    if tuple(grid.shape) != expected_grid_shape:
+        raise ValueError(
+            f"Expected redistortion grid {expected_grid_shape}, got {tuple(grid.shape)}"
+        )
+    if grid.device != img.device:
+        raise ValueError(
+            f"Redistortion grid is on {grid.device}, image is on {img.device}"
+        )
 
     out = F.grid_sample(
-        img.unsqueeze(0), grid, mode="bilinear",
+        img.unsqueeze(0), grid, mode=interpolation,
         padding_mode="zeros", align_corners=True,
     )
-    return out.squeeze(0)
+    # Bicubic interpolation may overshoot the input range.
+    return out.squeeze(0).clamp(0.0, 1.0)
 
 
-def redistort_and_crop(img, f, cx_render, cy_render, k, cx_orig, cy_orig, orig_w, orig_h, num_iters=15):
+def unsharp_mask(image, amount=0.0, sigma=0.7):
+    """Apply a channel-wise Gaussian unsharp mask to a CHW render."""
+    if image.ndim != 3:
+        raise ValueError(f"Expected CHW image, got shape {tuple(image.shape)}")
+    if not math.isfinite(float(amount)) or float(amount) < 0.0:
+        raise ValueError(f"Sharpen amount must be finite and non-negative, got {amount}")
+    if not math.isfinite(float(sigma)) or float(sigma) <= 0.0:
+        raise ValueError(f"Sharpen sigma must be positive and finite, got {sigma}")
+    if float(amount) == 0.0:
+        return image
+
+    channels, height, width = image.shape
+    radius = max(int(math.ceil(3.0 * float(sigma))), 1)
+    coordinates = torch.arange(
+        -radius,
+        radius + 1,
+        device=image.device,
+        dtype=image.dtype,
+    )
+    kernel_1d = torch.exp(-(coordinates**2) / (2.0 * float(sigma) ** 2))
+    kernel_1d = kernel_1d / kernel_1d.sum()
+    kernel_2d = torch.outer(kernel_1d, kernel_1d)
+    weights = kernel_2d.view(1, 1, *kernel_2d.shape).expand(
+        channels, 1, -1, -1
+    ).contiguous()
+
+    padding_mode = "reflect" if height > radius and width > radius else "replicate"
+    padded = F.pad(
+        image.unsqueeze(0),
+        (radius, radius, radius, radius),
+        mode=padding_mode,
+    )
+    blurred = F.conv2d(padded, weights, groups=channels).squeeze(0)
+    return torch.clamp(image + float(amount) * (image - blurred), 0.0, 1.0)
+
+
+def build_render_variant_specs(
+    render_variants,
+    redistort_interpolation="bilinear",
+    sharpen_amount=0.0,
+    variant_sharpen_amount=0.3,
+):
+    """Return stable output names and processing settings for this render run."""
+    _validate_interpolation(redistort_interpolation)
+    for name, value in (
+        ("sharpen_amount", sharpen_amount),
+        ("variant_sharpen_amount", variant_sharpen_amount),
+    ):
+        if not math.isfinite(float(value)) or float(value) < 0.0:
+            raise ValueError(f"{name} must be finite and non-negative, got {value}")
+
+    if not render_variants:
+        return ((None, redistort_interpolation, float(sharpen_amount)),)
+    if float(variant_sharpen_amount) <= 0.0:
+        raise ValueError("variant_sharpen_amount must be positive in variant mode")
+
+    sharp = float(variant_sharpen_amount)
+    sharp_tag = format(sharp, "g").replace(".", "p")
+    return (
+        ("bilinear_sharp0", "bilinear", 0.0),
+        (f"bilinear_sharp{sharp_tag}", "bilinear", sharp),
+        ("bicubic_sharp0", "bicubic", 0.0),
+        (f"bicubic_sharp{sharp_tag}", "bicubic", sharp),
+    )
+
+
+def redistort_and_crop(
+    img,
+    f,
+    cx_render,
+    cy_render,
+    k,
+    cx_orig,
+    cy_orig,
+    orig_w,
+    orig_h,
+    num_iters=15,
+    interpolation="bilinear",
+    grid=None,
+):
     """
     img: tensor [C,H,W] la anh render tren canvas "undistorted" da mo rong -- kich thuoc
          (H,W) va tam quang hoc (cx_render,cy_render) phai KHOP voi camera PINHOLE that su
@@ -166,7 +296,16 @@ def redistort_and_crop(img, f, cx_render, cy_render, k, cx_orig, cy_orig, orig_w
     Tra ve: anh da redistort VA da crop ve dung (orig_h, orig_w), giong pattern trong
     experiment_distort.py (undistort -> redistort_full -> crop bang offset giua 2 tam).
     """
-    distorted_full = redistort_image(img, f=f, cx=cx_render, cy=cy_render, k=k, num_iters=num_iters)
+    distorted_full = redistort_image(
+        img,
+        f=f,
+        cx=cx_render,
+        cy=cy_render,
+        k=k,
+        num_iters=num_iters,
+        interpolation=interpolation,
+        grid=grid,
+    )
 
     _, H, W = distorted_full.shape
     offset_x = int(round(cx_render - cx_orig))
@@ -199,11 +338,40 @@ def redistort_and_crop(img, f, cx_render, cy_render, k, cx_orig, cy_orig, orig_w
 
     return cropped
 
-def render_scene(dataset, pipeline, input_dir ,output_dir, scene_name, iteration, orig_dir):
+def render_scene(
+    dataset,
+    pipeline,
+    input_dir,
+    output_dir,
+    scene_name,
+    iteration,
+    orig_dir,
+    render_variants=False,
+    redistort_interpolation="bilinear",
+    sharpen_amount=0.0,
+    sharpen_sigma=0.7,
+    variant_sharpen_amount=0.3,
+    jpeg_quality=95,
+    jpeg_subsampling=2,
+    jpeg_optimize=False,
+):
     gaussians, loaded_iter = load_gaussians(dataset, iteration)
-    scene_dir = Path(output_dir) / scene_name
     test_poses_csv = Path(input_dir) / scene_name / "test" / "test_poses.csv" 
-    scene_dir.mkdir(parents=True, exist_ok=True)
+    variant_specs = build_render_variant_specs(
+        render_variants,
+        redistort_interpolation=redistort_interpolation,
+        sharpen_amount=sharpen_amount,
+        variant_sharpen_amount=variant_sharpen_amount,
+    )
+    if not math.isfinite(float(sharpen_sigma)) or float(sharpen_sigma) <= 0.0:
+        raise ValueError(f"sharpen_sigma must be positive and finite, got {sharpen_sigma}")
+
+    scene_dirs = {}
+    for variant_name, _, _ in variant_specs:
+        variant_root = Path(output_dir) if variant_name is None else Path(output_dir) / variant_name
+        scene_dir = variant_root / scene_name
+        scene_dir.mkdir(parents=True, exist_ok=True)
+        scene_dirs[variant_name] = scene_dir
 
     #VAR: load cameras intrinsic for distortion factor (anh GOC, truoc undistort)
     dist = load_distortion_params(orig_dir, scene_name)
@@ -254,6 +422,17 @@ def render_scene(dataset, pipeline, input_dir ,output_dir, scene_name, iteration
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+    redistortion_grid = None
+    if abs(dist["k"]) > 1e-8:
+        redistortion_grid = build_redistortion_grid(
+            und["height"],
+            und["width"],
+            f=und["f"],
+            cx=und["cx"],
+            cy=und["cy"],
+            k=dist["k"],
+            device=background.device,
+        )
 
     with open(test_poses_csv, newline="") as f:
         rows = list(csv.DictReader(f))
@@ -265,7 +444,7 @@ def render_scene(dataset, pipeline, input_dir ,output_dir, scene_name, iteration
                 width=und["width"], height=und["height"],
                 fx=und["f"], fy=und["f"],
             )
-            rendering = render(
+            base_rendering = render(
                 camera,
                 gaussians,
                 pipeline,
@@ -299,19 +478,44 @@ def render_scene(dataset, pipeline, input_dir ,output_dir, scene_name, iteration
             # und["f"], und["cx"], und["cy"]) roi crop ve dung kich thuoc GT goc
             # (dist["width"], dist["height"]) bang offset giua 2 tam quang hoc --
             # giong het pattern trong experiment_distort.py.
-            if abs(dist["k"]) > 1e-8:
-                # rendering_before = rendering.clone()
-                rendering = redistort_and_crop(
-                    rendering,
-                    f=und["f"],
-                    cx_render=und["cx"],
-                    cy_render=und["cy"],
-                    k=dist["k"],
-                    cx_orig=dist["cx"],
-                    cy_orig=dist["cy"],
-                    orig_w=dist["width"],
-                    orig_h=dist["height"],
-                )
+            interpolation_order = tuple(dict.fromkeys(spec[1] for spec in variant_specs))
+            for interpolation in interpolation_order:
+                if redistortion_grid is not None:
+                    warped = redistort_and_crop(
+                        base_rendering,
+                        f=und["f"],
+                        cx_render=und["cx"],
+                        cy_render=und["cy"],
+                        k=dist["k"],
+                        cx_orig=dist["cx"],
+                        cy_orig=dist["cy"],
+                        orig_w=dist["width"],
+                        orig_h=dist["height"],
+                        interpolation=interpolation,
+                        grid=redistortion_grid,
+                    )
+                else:
+                    warped = base_rendering
+
+                for variant_name, spec_interpolation, spec_amount in variant_specs:
+                    if spec_interpolation != interpolation:
+                        continue
+                    output = unsharp_mask(
+                        warped,
+                        amount=spec_amount,
+                        sigma=sharpen_sigma,
+                    )
+                    out_path = scene_dirs[variant_name] / row["image_name"]
+                    save_render_jpeg(
+                        output,
+                        out_path,
+                        quality=jpeg_quality,
+                        subsampling=jpeg_subsampling,
+                        optimize=jpeg_optimize,
+                    )
+                    if output is not warped:
+                        del output
+                del warped
                 # # THEMMM
                 # if idx == 0:
                 #     # crop rendering_before ve cung kich thuoc de so sanh cho cong bang
@@ -323,11 +527,13 @@ def render_scene(dataset, pipeline, input_dir ,output_dir, scene_name, iteration
                 #     torchvision.utils.save_image(rendering_before, "/kaggle/working/debug_before_redistort.png")
                 #     torchvision.utils.save_image(rendering, "/kaggle/working/debug_after_redistort.png")
 
-            out_path = scene_dir / row["image_name"]
-            save_render_jpeg(rendering, out_path, quality=95)
-            del camera, rendering
+            del camera, base_rendering
 
-    print(f"Rendered {len(rows)} images for {scene_name} from iteration {loaded_iter} -> {scene_dir}")
+    destinations = ", ".join(str(path) for path in scene_dirs.values())
+    print(
+        f"Rendered {len(rows)} images for {scene_name} from iteration "
+        f"{loaded_iter} -> {destinations}"
+    )
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="Render VAR scene with trained 3DGS")
@@ -339,6 +545,22 @@ if __name__ == "__main__":
     parser.add_argument("--iterations", default=-1, type=int)
     parser.add_argument("--image_dir", default="/kaggle/working/image_outputs")
     parser.add_argument("--scene_name", required=True)
+    parser.add_argument(
+        "--render_variants",
+        action="store_true",
+        help="Render bilinear/bicubic x sharpen 0/variant_sharpen_amount.",
+    )
+    parser.add_argument(
+        "--redistort_interpolation",
+        choices=("bilinear", "bicubic"),
+        default="bilinear",
+    )
+    parser.add_argument("--sharpen_amount", type=float, default=0.0)
+    parser.add_argument("--variant_sharpen_amount", type=float, default=0.3)
+    parser.add_argument("--sharpen_sigma", type=float, default=0.7)
+    parser.add_argument("--jpeg_quality", type=int, default=95)
+    parser.add_argument("--jpeg_subsampling", type=int, choices=(0, 1, 2), default=2)
+    parser.add_argument("--jpeg_optimize", action="store_true")
     parser.add_argument("--quiet", action="store_true")
 
     args = get_combined_args(parser)
@@ -354,5 +576,13 @@ if __name__ == "__main__":
         args.image_dir,
         args.scene_name,
         args.iterations,
-        args.orig_dir
+        args.orig_dir,
+        render_variants=args.render_variants,
+        redistort_interpolation=args.redistort_interpolation,
+        sharpen_amount=args.sharpen_amount,
+        sharpen_sigma=args.sharpen_sigma,
+        variant_sharpen_amount=args.variant_sharpen_amount,
+        jpeg_quality=args.jpeg_quality,
+        jpeg_subsampling=args.jpeg_subsampling,
+        jpeg_optimize=args.jpeg_optimize,
     )
