@@ -242,7 +242,7 @@ def evaluate_hf(dataset, gaussians, pipe, background, iteration,
 # ============================================================
 def evaluate_hf_gradient(dataset, gaussians, pipe, background, iteration,
                           orig_dir, hf_masks_dir, hf_grad_log_csv,
-                          num_samples=20, seed=42):
+                          lambda_dssim=0.2, num_samples=20, seed=42):
     """
     Render voi gradient bat, backward L1 loss, lay |grad| cua anh render,
     chia theo HF quintile (giong evaluate_hf nhung do GRADIENT thay vi LOSS).
@@ -311,11 +311,17 @@ def evaluate_hf_gradient(dataset, gaussians, pipe, background, iteration,
             # can gradient tren chinh tensor render (khong phai anh da clamp/detach)
             rendering.retain_grad()
 
-            # VAR: dung SUM thay vi MEAN. Neu dung mean(), gradient moi pixel
-            # bi chia cho C*H*W (hang trieu), lam gia tri qua nho (~1e-7),
-            # de bi lam tron thanh 0.000000 khi in/log. Dung sum() giu
-            # gradient moi pixel o do lon tu nhien (+-1 tu dao ham cua abs()).
-            eval_loss = (image_c - gt_image_c).abs().sum()  # E = |Render - GT|
+            # VAR: dung DUNG CONG THUC LOSS THAT cua training (L1+SSIM),
+            # KHONG dung L1 rieng hay L2 tu che. Ly do: muc tieu thi nghiem
+            # la kiem tra gradient THAT ma optimizer nhan duoc cho tung
+            # quintile, nen phai backward dung ham loss dang dung de train,
+            # khong phai mot proxy loss khac (se cho ket qua sai lech).
+            Ll1_eval = l1_loss(image_c, gt_image_c)
+            if FUSED_SSIM_AVAILABLE:
+                ssim_eval = fused_ssim(image_c.unsqueeze(0), gt_image_c.unsqueeze(0))
+            else:
+                ssim_eval = ssim(image_c, gt_image_c)
+            eval_loss = (1.0 - lambda_dssim) * Ll1_eval + lambda_dssim * (1.0 - ssim_eval)
             eval_loss.backward()
 
             if rendering.grad is None:
@@ -351,9 +357,9 @@ def evaluate_hf_gradient(dataset, gaussians, pipe, background, iteration,
     avg_contribs = [v / n_ok for v in contribs_sum]
     header = ("iter,Q1_grad,Q2_grad,Q3_grad,Q4_grad,Q5_grad,"
               "Q1_contrib,Q2_contrib,Q3_contrib,Q4_contrib,Q5_contrib")
-    _write_csv_row(hf_grad_log_csv, header, iteration, avg_grads, avg_contribs)
+    _write_csv_row_sci(hf_grad_log_csv, header, iteration, avg_grads, avg_contribs)
 
-    print(f"[HF GRAD] iter={iteration} n={n_ok} Q1_grad={avg_grads[0]:.6f} Q5_grad={avg_grads[4]:.6f}", flush=True)
+    print(f"[HF GRAD] iter={iteration} n={n_ok} Q1_grad={avg_grads[0]:.3e} Q5_grad={avg_grads[4]:.3e}", flush=True)
 
 
 # VAR: add cap max
@@ -531,7 +537,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             evaluate_hf_gradient(
                 dataset, gaussians, pipe, background, iteration,
                 orig_dir=orig_dir, hf_masks_dir=hf_masks_dir,
-                hf_grad_log_csv=hf_grad_log_csv, num_samples=hf_grad_samples,
+                hf_grad_log_csv=hf_grad_log_csv, lambda_dssim=opt.lambda_dssim,
+                num_samples=hf_grad_samples,
             )
 
 def prepare_output_and_logger(args):    
