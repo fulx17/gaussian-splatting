@@ -131,6 +131,22 @@ def _write_csv_row(csv_path, header, iteration, avg_means, avg_contribs):
         f.write(",".join(row_vals) + "\n")
 
 
+def _write_csv_row_sci(csv_path, header, iteration, avg_means, avg_contribs):
+    """Giong _write_csv_row nhung dung scientific notation cho cot 'means'
+    (vd Q1_grad..Q5_grad), vi gia tri gradient thuong rat nho (~1e-7) do
+    L1 loss dung .mean() tren hang trieu pixel. Cot contrib van la ti le
+    0..1 nen giu dinh dang thuong."""
+    write_header = not os.path.exists(csv_path)
+    out_dir = os.path.dirname(csv_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    with open(csv_path, "a", newline="") as f:
+        if write_header:
+            f.write(header + "\n")
+        row_vals = [str(iteration)] + [f"{v:.6e}" for v in avg_means] + [f"{v:.6f}" for v in avg_contribs]
+        f.write(",".join(row_vals) + "\n")
+
+
 # ============================================================
 # VAR: HF quintile LOSS evaluation (khong can gradient)
 # ============================================================
@@ -295,7 +311,11 @@ def evaluate_hf_gradient(dataset, gaussians, pipe, background, iteration,
             # can gradient tren chinh tensor render (khong phai anh da clamp/detach)
             rendering.retain_grad()
 
-            eval_loss = l1_loss(image_c, gt_image_c)  # E = |Render - GT|, dung loss dang dung
+            # VAR: dung SUM thay vi MEAN. Neu dung mean(), gradient moi pixel
+            # bi chia cho C*H*W (hang trieu), lam gia tri qua nho (~1e-7),
+            # de bi lam tron thanh 0.000000 khi in/log. Dung sum() giu
+            # gradient moi pixel o do lon tu nhien (+-1 tu dao ham cua abs()).
+            eval_loss = (image_c - gt_image_c).abs().sum()  # E = |Render - GT|
             eval_loss.backward()
 
             if rendering.grad is None:
