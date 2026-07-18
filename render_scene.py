@@ -198,7 +198,7 @@ def redistort_and_crop(img, f, cx_render, cy_render, k, cx_orig, cy_orig, orig_w
 
     return cropped
 
-def render_scene(dataset, pipeline, input_dir ,output_dir, scene_name, iteration, orig_dir):
+def render_scene(dataset, pipeline, input_dir, output_dir, scene_name, iteration, orig_dir, output_format="original"):
     gaussians, loaded_iter = load_gaussians(dataset, iteration)
     scene_dir = Path(output_dir) / scene_name
     test_poses_csv = Path(input_dir) / scene_name / "test" / "test_poses.csv" 
@@ -322,7 +322,12 @@ def render_scene(dataset, pipeline, input_dir ,output_dir, scene_name, iteration
                 #     torchvision.utils.save_image(rendering_before, "/kaggle/working/debug_before_redistort.png")
                 #     torchvision.utils.save_image(rendering, "/kaggle/working/debug_after_redistort.png")
 
-            out_path = scene_dir / row["image_name"]
+            if output_format == "png":
+                out_name = Path(row["image_name"]).stem + ".png"
+            else:
+                out_name = row["image_name"]
+
+            out_path = scene_dir / out_name
             torchvision.utils.save_image(rendering, out_path)
             del camera, rendering
 
@@ -339,6 +344,12 @@ if __name__ == "__main__":
     parser.add_argument("--image_dir", default="/kaggle/working/image_outputs")
     parser.add_argument("--scene_name", required=True)
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument(
+        "--output_format",
+        default="original",
+        choices=["original", "png"],
+        help="Định dạng lưu ảnh output: 'original' giữ nguyên đuôi file gốc từ CSV, 'png' ép toàn bộ về .png"
+    )
 
     args = get_combined_args(parser)
 
@@ -353,5 +364,6 @@ if __name__ == "__main__":
         args.image_dir,
         args.scene_name,
         args.iterations,
-        args.orig_dir
+        args.orig_dir,
+        args.output_format,   # thêm dòng này
     )
