@@ -5,7 +5,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torchvision
 from PIL import Image
 from tqdm import tqdm
 
@@ -24,22 +23,12 @@ try:
 except Exception:
     SPARSE_ADAM_AVAILABLE = False
 
+
 def camera_from_csv_row(row, idx, data_device, width, height, fx, fy):
-    """
-    Pose (qvec/tvec) lay tu CSV vi CSV chi co pose test, khong co model 3D.
-    Nhung width/height/fx/fy PHAI la cua camera "undistorted" (canvas da mo rong,
-    dung camera duy nhat trong train/sparse/0/cameras.bin sau khi undistort_scene() chay),
-    KHONG PHAI width/height/fx/fy trong CSV (do la kich thuoc/intrinsics anh GOC/GT,
-    dung de redistort+crop ve sau, khong dung de render).
-    """
     qvec = np.array(
         [float(row["qw"]), float(row["qx"]), float(row["qy"]), float(row["qz"])],
         dtype=np.float64,
     )
-
-    # The competition README calls tx/ty/tz "camera position", but the released
-    # public poses match COLMAP tvec distribution. 3DGS expects COLMAP-style
-    # world-to-camera translation here.
     tvec = np.array([float(row["tx"]), float(row["ty"]), float(row["tz"])], dtype=np.float64)
     rotation_world_to_camera = qvec2rotmat(qvec)
 
@@ -59,6 +48,7 @@ def camera_from_csv_row(row, idx, data_device, width, height, fx, fy):
         data_device=data_device,
     )
 
+
 def load_gaussians(dataset, iteration):
     gaussians = GaussianModel(dataset.sh_degree)
     loaded_iter = searchForMaxIteration(os.path.join(dataset.model_path, "point_cloud")) if iteration == -1 else iteration
@@ -74,9 +64,8 @@ def load_gaussians(dataset, iteration):
     gaussians.load_ply(ply_path, dataset.train_test_exp)
     return gaussians, loaded_iter
 
-# VAR: redistored
+
 def load_distortion_params(orig_dir, scene_name):
-    """Đọc camera SIMPLE_RADIAL gốc (chưa undistort) từ orig_dir"""
     cameras_bin = Path(orig_dir) / scene_name / "train" / "sparse" / "0" / "cameras.bin"
     cams = read_intrinsics_binary(str(cameras_bin))
     assert len(cams) == 1, f"Expect exactly 1 camera, got {len(cams)}"
@@ -88,19 +77,12 @@ def load_distortion_params(orig_dir, scene_name):
 
 
 def load_undistorted_camera_params(input_dir, scene_name):
-    """
-    Doc camera PINHOLE da undistort (canvas mo rong) tu input_dir -- day la camera
-    THAT SU dung de train/render, khac voi camera SIMPLE_RADIAL goc trong orig_dir.
-    input_dir phai la thu muc SAU khi undistort_scene() chay (vd /kaggle/working/cleaned_inputs),
-    khong phai orig_dir.
-    """
     cameras_bin = Path(input_dir) / scene_name / "train" / "sparse" / "0" / "cameras.bin"
     cams = read_intrinsics_binary(str(cameras_bin))
     assert len(cams) == 1, f"Expect exactly 1 camera, got {len(cams)}"
     cam = next(iter(cams.values()))
     assert cam.model == "PINHOLE", (
-        f"Camera trong {cameras_bin} phai la PINHOLE (da undistort), gap {cam.model}. "
-        f"Kiem tra da chay undistort_scene() cho input_dir nay chua."
+        f"Camera trong {cameras_bin} phai la PINHOLE (da undistort), gap {cam.model}."
     )
     fx, fy, cx, cy = cam.params
     assert abs(fx - fy) < 1e-3, f"fx != fy sau undistort ({fx} vs {fy})"
@@ -108,13 +90,9 @@ def load_undistorted_camera_params(input_dir, scene_name):
                 width=cam.width, height=cam.height)
 
 
-def redistort_image(img, f, cx, cy, k, num_iters=15):
-    """img: tensor [C,H,W] (anh render "undistorted", canvas mo rong) -> anh da meo theo k.
-
-    Giai nguoc r_d = r_u + k*r_u^3 bang Newton's method tren ban kinh (giong het
-    experiment_distort.py) -- on dinh hon fixed-point iteration cu tren x,y rieng le,
-    dac biet o vung ria canvas mo rong hoac khi k lon.
-    """
+# ===== THAY ĐỔI 1: redistort_image hỗ trợ chọn interpolation (bilinear/bicubic) =====
+def redistort_image(img, f, cx, cy, k, num_iters=15, interpolation="bicubic"):
+    """img: tensor [C,H,W] -> anh da meo theo k, dung interpolation duoc chon."""
     C, H, W = img.shape
     device = img.device
 
@@ -135,7 +113,6 @@ def redistort_image(img, f, cx, cy, k, num_iters=15):
         ru = ru - g / g_prime
 
     scale = torch.where(rd > 1e-12, ru / rd, torch.ones_like(rd))
-
     xu = xd * scale
     yu = yd * scale
 
@@ -147,25 +124,19 @@ def redistort_image(img, f, cx, cy, k, num_iters=15):
     grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
 
     out = F.grid_sample(
-        img.unsqueeze(0), grid, mode="bilinear",
+        img.unsqueeze(0), grid, mode=interpolation,
         padding_mode="zeros", align_corners=True,
     )
-    return out.squeeze(0)
+    # Bicubic co the vuot nguon 0-1, can clamp lai
+    return out.squeeze(0).clamp(0.0, 1.0)
 
 
-def redistort_and_crop(img, f, cx_render, cy_render, k, cx_orig, cy_orig, orig_w, orig_h, num_iters=15):
-    """
-    img: tensor [C,H,W] la anh render tren canvas "undistorted" da mo rong -- kich thuoc
-         (H,W) va tam quang hoc (cx_render,cy_render) phai KHOP voi camera PINHOLE that su
-         dung de render (doc tu load_undistorted_camera_params), khong duoc gia dinh la
-         W/2,H/2 vi COLMAP undistort co the khong dat tam dung giua canvas mo rong.
-    cx_orig, cy_orig, orig_w, orig_h: intrinsics + kich thuoc anh GOC/GT (distorted, tu
-         cameras.bin SIMPLE_RADIAL truoc undistort), dung de crop lai dung khung nhu GT.
-
-    Tra ve: anh da redistort VA da crop ve dung (orig_h, orig_w), giong pattern trong
-    experiment_distort.py (undistort -> redistort_full -> crop bang offset giua 2 tam).
-    """
-    distorted_full = redistort_image(img, f=f, cx=cx_render, cy=cy_render, k=k, num_iters=num_iters)
+def redistort_and_crop(img, f, cx_render, cy_render, k, cx_orig, cy_orig, orig_w, orig_h,
+                        num_iters=15, interpolation="bicubic"):
+    distorted_full = redistort_image(
+        img, f=f, cx=cx_render, cy=cy_render, k=k,
+        num_iters=num_iters, interpolation=interpolation,
+    )
 
     _, H, W = distorted_full.shape
     offset_x = int(round(cx_render - cx_orig))
@@ -184,8 +155,6 @@ def redistort_and_crop(img, f, cx_render, cy_render, k, cx_orig, cy_orig, orig_w
 
     cropped = distorted_full[:, y0:y1, x0:x1]
 
-    # Neu offset am hoac canvas render nho hon target (khong nen xay ra neu undistort
-    # dung max_scale du lon), pad zero cho khop kich thuoc goc thay vi silently resize.
     if cropped.shape[1] != orig_h or cropped.shape[2] != orig_w:
         pad_top = y0 - offset_y
         pad_left = x0 - offset_x
@@ -198,58 +167,69 @@ def redistort_and_crop(img, f, cx_render, cy_render, k, cx_orig, cy_orig, orig_w
 
     return cropped
 
-def render_scene(dataset, pipeline, input_dir, output_dir, scene_name, iteration, orig_dir, output_format="original"):
+
+# ===== THAY ĐỔI 2: thêm unsharp mask (sharpen) trên tensor float32 =====
+def unsharp_mask(image, amount=0.0, sigma=0.7):
+    """Ap dung Gaussian unsharp mask tren tensor CHW, float32, gia tri 0-1."""
+    if float(amount) == 0.0:
+        return image
+
+    channels, height, width = image.shape
+    radius = max(int(np.ceil(3.0 * float(sigma))), 1)
+    coordinates = torch.arange(-radius, radius + 1, device=image.device, dtype=image.dtype)
+    kernel_1d = torch.exp(-(coordinates**2) / (2.0 * float(sigma) ** 2))
+    kernel_1d = kernel_1d / kernel_1d.sum()
+    kernel_2d = torch.outer(kernel_1d, kernel_1d)
+    weights = kernel_2d.view(1, 1, *kernel_2d.shape).expand(channels, 1, -1, -1).contiguous()
+
+    padding_mode = "reflect" if height > radius and width > radius else "replicate"
+    padded = F.pad(image.unsqueeze(0), (radius, radius, radius, radius), mode=padding_mode)
+    blurred = F.conv2d(padded, weights, groups=channels).squeeze(0)
+    return torch.clamp(image + float(amount) * (image - blurred), 0.0, 1.0)
+
+
+# ===== THAY ĐỔI 3: lưu ảnh với cấu hình JPEG tối ưu (thay cho torchvision.save_image) =====
+def save_render(rendering_tensor, out_path, output_format, jpeg_quality=96,
+                 jpeg_subsampling=0, jpeg_optimize=True):
+    """
+    rendering_tensor: tensor [C,H,W], float32, gia tri 0-1
+    Neu output_format la 'png': luu PNG lossless nhu cu.
+    Neu la 'jpeg'/'jpg'/'original' voi duoi jpg: luu JPEG voi cau hinh toi uu
+    (quality=96, subsampling=0 tuc 4:4:4, optimize=True) -- dung cau hinh cua ban ban.
+    """
+    img_np = rendering_tensor.detach().cpu().clamp(0, 1).mul(255).round().byte()
+    img_np = img_np.permute(1, 2, 0).numpy()  # CHW -> HWC
+    pil_img = Image.fromarray(img_np, mode="RGB")
+
+    suffix = Path(out_path).suffix.lower()
+    if suffix in (".jpg", ".jpeg"):
+        pil_img.save(
+            out_path,
+            format="JPEG",
+            quality=jpeg_quality,
+            subsampling=jpeg_subsampling,
+            optimize=jpeg_optimize,
+        )
+    else:
+        pil_img.save(out_path, format="PNG")
+
+
+def render_scene(dataset, pipeline, input_dir, output_dir, scene_name, iteration, orig_dir,
+                  output_format="original", redistort_interpolation="bicubic",
+                  sharpen_amount=0.3, sharpen_sigma=0.7,
+                  jpeg_quality=96, jpeg_subsampling=0, jpeg_optimize=True):
     gaussians, loaded_iter = load_gaussians(dataset, iteration)
     scene_dir = Path(output_dir) / scene_name
-    test_poses_csv = Path(input_dir) / scene_name / "test" / "test_poses.csv" 
+    test_poses_csv = Path(input_dir) / scene_name / "test" / "test_poses.csv"
     scene_dir.mkdir(parents=True, exist_ok=True)
 
-    #VAR: load cameras intrinsic for distortion factor (anh GOC, truoc undistort)
     dist = load_distortion_params(orig_dir, scene_name)
     print(f"[{scene_name}] distortion k={dist['k']:.6f} f={dist['f']:.2f} "
           f"cx={dist['cx']:.2f} cy={dist['cy']:.2f} size=({dist['width']}x{dist['height']})")
 
-    # VAR: camera PINHOLE da undistort (canvas mo rong) -- dung camera nay de RENDER,
-    # khong dung width/height/fx/fy trong CSV (do la kich thuoc GT goc).
     und = load_undistorted_camera_params(input_dir, scene_name)
     print(f"[{scene_name}] undistorted render canvas f={und['f']:.2f} "
           f"cx={und['cx']:.2f} cy={und['cy']:.2f} size=({und['width']}x{und['height']})")
-    
-
-    # #====================================================================================================================
-    # print(f"[{scene_name}] dist: k={dist['k']:.8f} f={dist['f']:.3f} "
-    #     f"size=({dist['width']}x{dist['height']})")
-    # print(f"[{scene_name}] und : f={und['f']:.3f} "
-    #     f"size=({und['width']}x{und['height']})")
-
-    # # So sanh f_undist vs f_orig -- thuat toan redistort_and_crop dang GIA DINH 2 gia tri
-    # # nay xap xi bang nhau (chi lech cx,cy do canvas mo rong). Neu lech nhieu, do cong
-    # # tinh ra se bi sai ty le.
-    # f_diff_pct = abs(und['f'] - dist['f']) / dist['f'] * 100
-    # print(f"f_undist vs f_orig: diff={und['f']-dist['f']:+.3f}  ({f_diff_pct:.2f}%)")
-
-    # # Ban kinh chuan hoa tai GOC anh (worst case that su, khong phai mep giua canh)
-    # # vi diem xa tam quang hoc nhat luon nam o 4 goc, khong phai mep ngang/doc.
-    # rd_edge_mid = (dist['width'] / 2) / dist['f']          # mep giua canh ngang (cu, thieu)
-    # rd_corner = np.sqrt((dist['width'] / 2) ** 2 + (dist['height'] / 2) ** 2) / dist['f']  # goc anh
-
-    # for label, rd in [("mep giua canh", rd_edge_mid), ("goc anh (worst case)", rd_corner)]:
-    #     delta = dist['k'] * rd ** 3
-    #     pct = abs(delta) / rd * 100
-    #     print(f"  rd={rd:.4f} tai [{label}]: k*rd^3={delta:.6f}  (lech {pct:.2f}% so voi rd)")
-
-    # # Kiem tra vung invalid (chi xay ra khi k < 0): neu rd_corner > rd_max, nghia la
-    # # 4 goc anh GOC nam trong vung KHONG CO NGHIEM THAT khi redistort -- day la vung
-    # # se bi mat/den neu code xu ly dung (giong het ảnh 2 cua experiment_distort.py).
-    # if dist['k'] < 0:
-    #     ru_max = np.sqrt(-1.0 / (3 * dist['k']))
-    #     rd_max = ru_max + dist['k'] * ru_max ** 3
-    #     print(f"k<0 -> rd_max (nguong co nghiem)={rd_max:.4f}")
-    #     print(f"  rd_corner ({rd_corner:.4f}) {'VUOT NGUONG -> co vung invalid o goc anh' if rd_corner > rd_max else 'trong nguong, khong co vung invalid'}")
-    # else:
-    #     print("k >= 0 -> khong co vung invalid (chi xay ra khi k<0)")
-
-    # #=============================================================================================================
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -273,33 +253,8 @@ def render_scene(dataset, pipeline, input_dir, output_dir, scene_name, iteration
                 separate_sh=SPARSE_ADAM_AVAILABLE,
             )["render"]
 
-            # if idx == 0:
-            #     # VAR-DEBUG: ve luoi len anh render TRUOC khi redistort, de kiem tra
-            #     # warp phi tuyen co thuc su xay ra hay chi la tinh tien (crop offset).
-            #     debug_grid = rendering.clone()
-            #     C, Hc, Wc = debug_grid.shape
-            #     step = 50
-            #     for gx in range(0, Wc, step):
-            #         debug_grid[:, :, gx] = torch.tensor([1.0, 0.0, 0.0], device=debug_grid.device).view(3, 1)
-            #     for gy in range(0, Hc, step):
-            #         debug_grid[:, gy, :] = torch.tensor([1.0, 0.0, 0.0], device=debug_grid.device).view(3, 1)
-
-            #     debug_grid_after = redistort_and_crop(
-            #         debug_grid,
-            #         f=und["f"], cx_render=und["cx"], cy_render=und["cy"],
-            #         k=dist["k"],
-            #         cx_orig=dist["cx"], cy_orig=dist["cy"],
-            #         orig_w=dist["width"], orig_h=dist["height"],
-            #     )
-            #     torchvision.utils.save_image(debug_grid, "/kaggle/working/debug_grid_before.png")
-            #     torchvision.utils.save_image(debug_grid_after, "/kaggle/working/debug_grid_after.png")
-
-            # VAR: redistort tren canvas mo rong (dung intrinsics cua chinh canvas do:
-            # und["f"], und["cx"], und["cy"]) roi crop ve dung kich thuoc GT goc
-            # (dist["width"], dist["height"]) bang offset giua 2 tam quang hoc --
-            # giong het pattern trong experiment_distort.py.
+            # ===== redistort dung interpolation da chon (mac dinh bicubic) =====
             if abs(dist["k"]) > 1e-8:
-                # rendering_before = rendering.clone()
                 rendering = redistort_and_crop(
                     rendering,
                     f=und["f"],
@@ -310,28 +265,30 @@ def render_scene(dataset, pipeline, input_dir, output_dir, scene_name, iteration
                     cy_orig=dist["cy"],
                     orig_w=dist["width"],
                     orig_h=dist["height"],
+                    interpolation=redistort_interpolation,
                 )
-                # # THEMMM
-                # if idx == 0:
-                #     # crop rendering_before ve cung kich thuoc de so sanh cho cong bang
-                #     _, Hc, Wc = rendering.shape
-                #     crop_before = rendering_before[:, :Hc, :Wc]  # crop tho, chi de debug
-                #     diff = (rendering - crop_before).abs()
-                #     print(f"[DEBUG] redistort diff: mean={diff.mean().item():.6f} "
-                #         f"max={diff.max().item():.6f}")
-                #     torchvision.utils.save_image(rendering_before, "/kaggle/working/debug_before_redistort.png")
-                #     torchvision.utils.save_image(rendering, "/kaggle/working/debug_after_redistort.png")
+
+            # ===== sharpen truoc khi luu, van tren tensor float32 =====
+            rendering = unsharp_mask(rendering, amount=sharpen_amount, sigma=sharpen_sigma)
 
             if output_format == "png":
                 out_name = Path(row["image_name"]).stem + ".png"
+            elif output_format == "jpeg":
+                out_name = Path(row["image_name"]).stem + ".jpg"
             else:
                 out_name = row["image_name"]
 
             out_path = scene_dir / out_name
-            torchvision.utils.save_image(rendering, out_path)
+            save_render(
+                rendering, out_path, output_format,
+                jpeg_quality=jpeg_quality,
+                jpeg_subsampling=jpeg_subsampling,
+                jpeg_optimize=jpeg_optimize,
+            )
             del camera, rendering
 
     print(f"Rendered {len(rows)} images for {scene_name} from iteration {loaded_iter} -> {scene_dir}")
+
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="Render VAR scene with trained 3DGS")
@@ -346,10 +303,16 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument(
         "--output_format",
-        default="original",
-        choices=["original", "png"],
-        help="Định dạng lưu ảnh output: 'original' giữ nguyên đuôi file gốc từ CSV, 'png' ép toàn bộ về .png"
+        default="jpeg",
+        choices=["original", "png", "jpeg"],
+        help="'original' giu duoi file goc, 'png' ep ve .png, 'jpeg' ep ve .jpg voi cau hinh toi uu"
     )
+    parser.add_argument("--redistort_interpolation", choices=["bilinear", "bicubic"], default="bicubic")
+    parser.add_argument("--sharpen_amount", type=float, default=0.3)
+    parser.add_argument("--sharpen_sigma", type=float, default=0.7)
+    parser.add_argument("--jpeg_quality", type=int, default=96)
+    parser.add_argument("--jpeg_subsampling", type=int, choices=[0, 1, 2], default=0)
+    parser.add_argument("--jpeg_optimize", action="store_true", default=True)
 
     args = get_combined_args(parser)
 
@@ -365,5 +328,11 @@ if __name__ == "__main__":
         args.scene_name,
         args.iterations,
         args.orig_dir,
-        args.output_format,   # thêm dòng này
+        output_format=args.output_format,
+        redistort_interpolation=args.redistort_interpolation,
+        sharpen_amount=args.sharpen_amount,
+        sharpen_sigma=args.sharpen_sigma,
+        jpeg_quality=args.jpeg_quality,
+        jpeg_subsampling=args.jpeg_subsampling,
+        jpeg_optimize=args.jpeg_optimize,
     )
