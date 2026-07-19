@@ -193,22 +193,37 @@ def save_render(rendering_tensor, out_path, output_format, jpeg_quality=96,
                  jpeg_subsampling=0, jpeg_optimize=True):
     """
     rendering_tensor: tensor [C,H,W], float32, gia tri 0-1
-    Neu output_format la 'png': luu PNG lossless nhu cu.
-    Neu la 'jpeg'/'jpg'/'original' voi duoi jpg: luu JPEG voi cau hinh toi uu
-    (quality=96, subsampling=0 tuc 4:4:4, optimize=True) -- dung cau hinh cua ban ban.
+    Ho tro them: 'png16' (PNG 16-bit) va 'npy32' (float32 raw, khong lossy)
     """
+    suffix = Path(out_path).suffix.lower()
+
+    # ===== NPY 32-bit: luu float32 raw, khong quantize =====
+    if suffix == ".npy":
+        arr = rendering_tensor.detach().cpu().clamp(0, 1).numpy().astype(np.float32)
+        # luu HWC cho de doc lai bang cv2/np thong nhat voi cac dinh dang khac
+        arr = np.transpose(arr, (1, 2, 0))
+        np.save(out_path, arr)
+        return
+
+    # ===== PNG 16-bit =====
+    if suffix == ".png16" or (suffix == ".png" and output_format == "png16"):
+        img_np = rendering_tensor.detach().cpu().clamp(0, 1).mul(65535).round()
+        img_np = img_np.numpy().astype(np.uint16)
+        img_np = np.transpose(img_np, (1, 2, 0))  # CHW -> HWC
+        # PIL khong ho tro luu PNG 16-bit RGB truc tiep tot bang cv2, dung cv2 thay the
+        import cv2
+        cv2.imwrite(str(out_path), cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR))
+        return
+
+    # ===== PNG 8-bit (giu nguyen nhu cu) =====
     img_np = rendering_tensor.detach().cpu().clamp(0, 1).mul(255).round().byte()
-    img_np = img_np.permute(1, 2, 0).numpy()  # CHW -> HWC
+    img_np = img_np.permute(1, 2, 0).numpy()
     pil_img = Image.fromarray(img_np, mode="RGB")
 
-    suffix = Path(out_path).suffix.lower()
     if suffix in (".jpg", ".jpeg"):
         pil_img.save(
-            out_path,
-            format="JPEG",
-            quality=jpeg_quality,
-            subsampling=jpeg_subsampling,
-            optimize=jpeg_optimize,
+            out_path, format="JPEG",
+            quality=jpeg_quality, subsampling=jpeg_subsampling, optimize=jpeg_optimize,
         )
     else:
         pil_img.save(out_path, format="PNG")
@@ -273,6 +288,10 @@ def render_scene(dataset, pipeline, input_dir, output_dir, scene_name, iteration
 
             if output_format == "png":
                 out_name = Path(row["image_name"]).stem + ".png"
+            elif output_format == "png16":
+                out_name = Path(row["image_name"]).stem + ".png"   # vẫn đuôi .png, phân biệt bằng output_format truyền vào
+            elif output_format == "npy32":
+                out_name = Path(row["image_name"]).stem + ".npy"
             elif output_format == "jpeg":
                 out_name = Path(row["image_name"]).stem + ".jpg"
             else:
@@ -304,8 +323,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output_format",
         default="jpeg",
-        choices=["original", "png", "jpeg"],
-        help="'original' giu duoi file goc, 'png' ep ve .png, 'jpeg' ep ve .jpg voi cau hinh toi uu"
+        choices=["original", "png", "png16", "npy32", "jpeg"],
+        help="'original' giu duoi file goc, 'png' ep ve .png 8-bit, "
+            "'png16' ep ve .png 16-bit, 'npy32' luu float32 raw .npy, "
+            "'jpeg' ep ve .jpg voi cau hinh toi uu"
     )
     parser.add_argument("--redistort_interpolation", choices=["bilinear", "bicubic"], default="bicubic")
     parser.add_argument("--sharpen_amount", type=float, default=0.3)
